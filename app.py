@@ -1,29 +1,15 @@
 import os
-import time
 from datetime import datetime, timezone
+
 import streamlit as st
+
 from env_watchdog import run_watchdog, load_latest, load_history_tail, save_result
 
 
 st.set_page_config(page_title="Environmental Specialist Watch Dog", layout="wide")
-
 st.title("Environmental Specialist Watch Dog")
-st.caption("Local LLM (Ollama) + Web retrieval (Tavily) + strict output contract")
+st.caption("Online mode: Tavily retrieval + Groq (OpenAI-compatible) summarization + strict output contract")
 
-with st.sidebar:
-    st.header("Runtime")
-    model = st.text_input("Ollama model", value=os.environ.get("OLLAMA_MODEL", "qwen2.5:7b-instruct"))
-    today_override = st.text_input("Today override (YYYY-MM-DD, optional)", value=os.environ.get("TODAY_OVERRIDE", ""))
-    max_results_per_topic = st.number_input("Search results per topic", min_value=2, max_value=10, value=int(os.environ.get("MAX_RESULTS_PER_TOPIC", "5")))
-    search_depth = st.selectbox("Tavily search_depth", ["basic", "advanced"], index=1 if os.environ.get("TAVILY_SEARCH_DEPTH", "advanced") == "advanced" else 0)
-    include_domains = st.text_area(
-        "Preferred domains (optional, comma-separated)",
-        value=os.environ.get("PREFERRED_DOMAINS", ""),
-        help="Optional: add domains to bias results (e.g., imo.org, europa.eu, uscg.mil, amsa.gov.au, dnv.com)"
-    )
-    st.divider()
-    auto_refresh = st.checkbox("Auto-run periodically", value=False)
-    refresh_seconds = st.number_input("Auto-run interval (seconds)", min_value=60, max_value=24*3600, value=int(os.environ.get("REFRESH_SECONDS", "3600")))
 
 def _parse_domains(raw: str):
     raw = (raw or "").strip()
@@ -31,6 +17,50 @@ def _parse_domains(raw: str):
         return None
     parts = [p.strip() for p in raw.split(",") if p.strip()]
     return parts or None
+
+
+def _today_utc_iso(today_override: str) -> str:
+    today_override = (today_override or "").strip()
+    if today_override:
+        return today_override
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+with st.sidebar:
+    st.header("Settings")
+
+    today_override = st.text_input("Today override (YYYY-MM-DD, optional)", value=os.environ.get("TODAY_OVERRIDE", ""))
+    max_results_per_topic = st.number_input(
+        "Tavily results per topic",
+        min_value=2,
+        max_value=10,
+        value=int(os.environ.get("MAX_RESULTS_PER_TOPIC", "5")),
+    )
+    search_depth = st.selectbox(
+        "Tavily search depth",
+        ["basic", "advanced"],
+        index=1 if os.environ.get("TAVILY_SEARCH_DEPTH", "advanced") == "advanced" else 0,
+    )
+
+    include_domains = st.text_area(
+        "Preferred domains (optional, comma-separated)",
+        value=os.environ.get("PREFERRED_DOMAINS", ""),
+        help="Example: imo.org, europa.eu, amsa.gov.au, uscg.mil, dnv.com",
+    )
+
+    st.divider()
+    auto_refresh = st.checkbox("Auto-run periodically", value=False)
+    refresh_minutes = st.number_input("Auto-run interval (minutes)", min_value=5, max_value=24 * 60, value=60)
+
+    st.divider()
+    st.caption("Secrets required in Streamlit Cloud:")
+    st.code('TAVILY_API_KEY="..."\nGROQ_API_KEY="..."\nGROQ_MODEL="llama-3.1-8b-instant"', language="text")
+
+
+# Auto-refresh without infinite loops (Streamlit Cloud safe)
+if auto_refresh:
+    st.autorefresh(interval=int(refresh_minutes) * 60 * 1000, key="watchdog_autorefresh")
+
 
 col1, col2 = st.columns([1, 1], gap="large")
 
@@ -40,7 +70,7 @@ with col1:
     if latest:
         st.code(latest, language="text")
     else:
-        st.info("No result posted yet. Click Run now.")
+        st.info("No result posted yet.")
 
 with col2:
     st.subheader("History (most recent first)")
@@ -57,13 +87,12 @@ st.divider()
 
 run_now = st.button("Run now", type="primary")
 
-def _get_today_utc_iso():
-    if today_override.strip():
-        return today_override.strip()
-    return datetime.now(timezone.utc).date().isoformat()
+# If autorefresh is enabled, run automatically on each refresh.
+should_run = run_now or auto_refresh
 
-def _do_run():
-    today_utc = _get_today_utc_iso()
+if should_run:
+    today_utc = _today_utc_iso(today_override)
+
     output = run_watchdog(
         today_utc=today_utc,
         tavily_search_depth=search_depth,
@@ -74,19 +103,3 @@ def _do_run():
     save_result(output)
     st.success("Posted (saved) new result.")
     st.code(output, language="text")
-
-if run_now:
-    _do_run()
-
-if auto_refresh:
-    # simple foreground loop; run only while page is open
-    st.warning("Auto-run is active while this page stays open.")
-    placeholder = st.empty()
-    while True:
-        with placeholder.container():
-            st.write(f"Auto-run at UTC: {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
-            try:
-                _do_run()
-            except Exception as e:
-                st.error(f"Auto-run failed: {e}")
-        time.sleep(int(refresh_seconds))
