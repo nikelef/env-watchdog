@@ -1,4 +1,4 @@
 streamlit==1.41.1
 tavily-python==0.5.0
-ollama==0.4.7
+openai==1.63.0
 python-dotenv==1.0.1
