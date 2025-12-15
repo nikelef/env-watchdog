@@ -66,11 +66,11 @@ def _do_run():
     today_utc = _get_today_utc_iso()
     output = run_watchdog(
         today_utc=today_utc,
-        ollama_model=model.strip(),
         tavily_search_depth=search_depth,
         max_results_per_topic=int(max_results_per_topic),
         preferred_domains=_parse_domains(include_domains),
     )
+
     save_result(output)
     st.success("Posted (saved) new result.")
     st.code(output, language="text")
