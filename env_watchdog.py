@@ -1,12 +1,11 @@
 import os
 import json
-import re
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
-from openai import OpenAI
-from tavily import TavilyClient  # pip: tavily-python
+from typing import Dict, List, Optional
 
+import streamlit as st
+from openai import OpenAI
+from tavily import TavilyClient
 
 
 SYSTEM_PROMPT = """
@@ -150,14 +149,8 @@ DATA_DIR = os.environ.get("DATA_DIR", "data")
 LATEST_PATH = os.path.join(DATA_DIR, "latest.txt")
 HISTORY_PATH = os.path.join(DATA_DIR, "history.jsonl")
 
-def _groq_client() -> OpenAI:
-    key = os.environ.get("GROQ_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("Missing GROQ_API_KEY environment variable.")
-    return OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
 
-
-def _ensure_data_dir():
+def _ensure_data_dir() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
@@ -184,10 +177,10 @@ def load_latest() -> str:
 def load_history_tail(limit: int = 50) -> List[dict]:
     if not os.path.exists(HISTORY_PATH):
         return []
-    # read tail safely for moderate file sizes
     with open(HISTORY_PATH, "r", encoding="utf-8") as f:
         lines = f.readlines()
-    out = []
+
+    out: List[dict] = []
     for line in reversed(lines[-limit:]):
         line = line.strip()
         if not line:
@@ -206,6 +199,13 @@ def _tavily_client() -> TavilyClient:
     return TavilyClient(api_key=key)
 
 
+def _groq_client() -> OpenAI:
+    key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("Missing GROQ_API_KEY environment variable.")
+    return OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
+
+
 def _search_topic(
     client: TavilyClient,
     topic_name: str,
@@ -215,14 +215,12 @@ def _search_topic(
     max_results: int,
     preferred_domains: Optional[List[str]],
 ) -> List[dict]:
-    # Bias query toward primary/official sources and recency
     q = (
         f"{topic_name} shipping regulation update OR amendment OR circular OR guidance "
         f"site:imo.org OR MEPC OR MSC OR flag circular OR class technical news OR EU regulation "
         f"within last 12 months {today_utc}"
     )
 
-    # Tavily supports include_domains; keep optional
     kwargs = {}
     if preferred_domains:
         kwargs["include_domains"] = preferred_domains
@@ -236,18 +234,16 @@ def _search_topic(
         include_images=False,
         **kwargs,
     )
-    # Each item generally includes: title, url, content/snippet, score, etc.
+
     results = res.get("results", []) if isinstance(res, dict) else []
-    # Attach topic metadata for later prompting
     for r in results:
         r["_topic"] = topic_name
         r["_topic_guidance"] = topic_guidance
     return results
 
 
-def _build_context(sources: List[dict], max_chars: int = 24000) -> str:
-    # Compact, deterministic context for the LLM
-    chunks = []
+def _build_context(sources: List[dict], max_chars: int = 8000) -> str:
+    chunks: List[str] = []
     for s in sources:
         title = (s.get("title") or "").strip()
         url = (s.get("url") or "").strip()
@@ -255,8 +251,7 @@ def _build_context(sources: List[dict], max_chars: int = 24000) -> str:
         topic = (s.get("_topic") or "").strip()
         if not url:
             continue
-        block = f"TOPIC: {topic}\nTITLE: {title}\nURL: {url}\nSNIPPET: {content}\n"
-        chunks.append(block)
+        chunks.append(f"TOPIC: {topic}\nTITLE: {title}\nURL: {url}\nSNIPPET: {content}\n")
 
     text = "\n".join(chunks).strip()
     if len(text) <= max_chars:
@@ -267,36 +262,30 @@ def _build_context(sources: List[dict], max_chars: int = 24000) -> str:
 def _validate_output(out: str) -> str:
     out = (out or "").strip()
 
-    # Option A strict token
     if out == "NO_UPDATES":
         return out
 
-    # Option B: bullet list, max 8 lines, each line starts with "- "
     lines = [ln.rstrip() for ln in out.splitlines() if ln.strip()]
-
-    # Remove accidental leading/trailing junk lines like "Output:" if present
-    # but DO NOT allow headings etc. If it doesn't validate, force NO_UPDATES.
     if not lines:
         return "NO_UPDATES"
+
     if len(lines) > 8:
         lines = lines[:8]
 
     for ln in lines:
         if not ln.startswith("- "):
             return "NO_UPDATES"
-        # Must have 5 fields separated by " - " at least 4 separators
         if ln.count(" - ") < 4:
             return "NO_UPDATES"
-        # URL must be https or "link unavailable"
         tail = ln.split(" - ")[-1].strip()
         if not (tail.startswith("https://") or tail == "link unavailable"):
             return "NO_UPDATES"
 
-    # Ensure ASCII as far as possible
     try:
         out_ascii = "\n".join(lines).encode("ascii", errors="ignore").decode("ascii")
     except Exception:
         out_ascii = "\n".join(lines)
+
     return out_ascii.strip() if out_ascii.strip() else "NO_UPDATES"
 
 
@@ -306,14 +295,13 @@ def run_watchdog(
     max_results_per_topic: int = 5,
     preferred_domains: Optional[List[str]] = None,
 ) -> str:
-
-    client = _tavily_client()
+    tav = _tavily_client()
 
     all_sources: List[dict] = []
     for topic, guidance in TOPICS.items():
         all_sources.extend(
             _search_topic(
-                client=client,
+                client=tav,
                 topic_name=topic,
                 topic_guidance=guidance,
                 today_utc=today_utc,
@@ -323,9 +311,8 @@ def run_watchdog(
             )
         )
 
-    # Deduplicate by URL
     seen = set()
-    uniq = []
+    uniq: List[dict] = []
     for s in all_sources:
         u = (s.get("url") or "").strip()
         if not u or u in seen:
@@ -335,7 +322,6 @@ def run_watchdog(
 
     context = _build_context(uniq)
 
-    # Single combined call: ask for max 8 bullets across everything
     user_prompt = (
         f"today={today_utc}\n"
         f"Task: Identify ONLY developments within the last 365 days relative to today.\n"
@@ -343,20 +329,22 @@ def run_watchdog(
         f"Return ONLY in the required output format.\n\n"
         f"SOURCES:\n{context}\n"
     )
+
     client_llm = _groq_client()
     model_id = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 
-    resp = client_llm.chat.completions.create(
-        model=model_id,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.1,
-    )
-
-    text = (resp.choices[0].message.content or "").strip()
-    return _validate_output(text)
-
-
-    
+    try:
+        resp = client_llm.chat.completions.create(
+            model=model_id,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.1,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        return _validate_output(text)
+    except Exception as e:
+        # Show real error in Cloud UI/logs, but still obey output contract:
+        st.error(f"LLM request failed: {type(e).__name__}: {e}")
+        return "NO_UPDATES"
