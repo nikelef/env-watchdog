@@ -4,9 +4,9 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
-
+from openai import OpenAI
 from tavily import TavilyClient  # pip: tavily-python
-import ollama  # pip: ollama
+
 
 
 SYSTEM_PROMPT = """
@@ -149,6 +149,12 @@ TOPICS: Dict[str, str] = {
 DATA_DIR = os.environ.get("DATA_DIR", "data")
 LATEST_PATH = os.path.join(DATA_DIR, "latest.txt")
 HISTORY_PATH = os.path.join(DATA_DIR, "history.jsonl")
+
+def _groq_client() -> OpenAI:
+    key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("Missing GROQ_API_KEY environment variable.")
+    return OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
 
 
 def _ensure_data_dir():
@@ -338,21 +344,11 @@ def run_watchdog(
         f"SOURCES:\n{context}\n"
     )
 
-    resp = ollama.chat(
-        model=ollama_model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        options={
-            "temperature": 0.1,
-        },
-    )
+    from openai import OpenAI  # make sure this import exists at the top
+    
+    def _groq_client() -> OpenAI:
+        key = os.environ.get("GROQ_API_KEY", "").strip()
+        if not key:
+            raise RuntimeError("Missing GROQ_API_KEY environment variable.")
+        return OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
 
-    text = ""
-    try:
-        text = resp["message"]["content"]
-    except Exception:
-        text = str(resp)
-
-    return _validate_output(text)
