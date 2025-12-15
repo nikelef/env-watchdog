@@ -302,11 +302,11 @@ def _validate_output(out: str) -> str:
 
 def run_watchdog(
     today_utc: str,
-    ollama_model: str = "qwen2.5:7b-instruct",
     tavily_search_depth: str = "advanced",
     max_results_per_topic: int = 5,
     preferred_domains: Optional[List[str]] = None,
 ) -> str:
+
     client = _tavily_client()
 
     all_sources: List[dict] = []
@@ -343,12 +343,20 @@ def run_watchdog(
         f"Return ONLY in the required output format.\n\n"
         f"SOURCES:\n{context}\n"
     )
+    client_llm = _groq_client()
+    model_id = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 
-    from openai import OpenAI  # make sure this import exists at the top
+    resp = client_llm.chat.completions.create(
+        model=model_id,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.1,
+    )
+
+    text = (resp.choices[0].message.content or "").strip()
+    return _validate_output(text)
+
+
     
-    def _groq_client() -> OpenAI:
-        key = os.environ.get("GROQ_API_KEY", "").strip()
-        if not key:
-            raise RuntimeError("Missing GROQ_API_KEY environment variable.")
-        return OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
-
