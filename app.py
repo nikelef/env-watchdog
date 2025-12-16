@@ -123,12 +123,12 @@ with st.sidebar:
     include_domains = st.text_area(
         "Preferred domains (optional, comma-separated)",
         value=os.environ.get("PREFERRED_DOMAINS", ""),
-        help="Example: imo.org, europa.eu, amsa.gov.au, uscg.mil, epa.gov, carbc.ca.gov, dnv.com, lr.org",
+        help="Example: imo.org, europa.eu, amsa.gov.au, uscg.mil, epa.gov, carbc.ca.gov, dnv.com, lr.org, iacs.org.uk, classnk.or.jp, bureauveritas.gr, ccs.org.cn, ww2.eagle.org, classnk.com, krs.co.kr, rina.org,   ",
     )
 
     st.divider()
     auto_refresh = st.checkbox("Auto-refresh", value=False)
-    refresh_minutes = st.number_input("Auto-refresh interval (minutes)", min_value=5, max_value=24 * 60, value=120)
+    refresh_minutes = st.number_input("Auto-refresh interval (minutes)", min_value=30, max_value=24 * 60, value=120)
 
     st.divider()
     st.caption("Streamlit Cloud Secrets required:")
