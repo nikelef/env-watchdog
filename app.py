@@ -1,7 +1,7 @@
 import os
-import html
 from datetime import datetime, timezone
 
+import pandas as pd
 import streamlit as st
 
 from env_watchdog import (
@@ -31,85 +31,53 @@ def _today_utc_iso(today_override: str) -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
-def _render_category_table(cat: str, cat_items: list, latest_added_ids: set[str]) -> None:
-    """
-    Render an HTML table so URLs are clickable.
-    Highlight the first (latest) row in light blue.
-    """
+def _render_category_df(cat_items: list, latest_added_ids: set[str]) -> None:
     if not cat_items:
         st.info("No items stored for this category.")
         return
 
-    # Build rows (already sorted newest-first by backend)
     rows = []
     for it in cat_items:
         _id = it.get("id", "")
-        rows.append({
-            "NEW": "YES" if _id in latest_added_ids else "",
-            "Date": it.get("date", "date unclear"),
-            "Authority": it.get("authority", ""),
-            "Instrument": it.get("instrument", ""),
-            "Practical summary": it.get("summary", ""),
-            "URL": it.get("url", "link unavailable"),
-            "First seen (UTC)": it.get("first_seen_utc", ""),
-        })
+        url = it.get("url", "link unavailable")
+        if not isinstance(url, str):
+            url = "link unavailable"
 
-    # HTML table with hover and clickable links
-    # Highlight latest row (row 0) light blue.
-    css = """
-    <style>
-      .wd-table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
-      .wd-table th, .wd-table td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
-      .wd-table th { background: #f4f6f8; text-align: left; }
-      .wd-latest { background: #d9ecff; } /* light blue */
-      .wd-new { font-weight: 600; }
-      .wd-url a { text-decoration: none; }
-      .wd-url a:hover { text-decoration: underline; }
-    </style>
-    """
-
-    header_cols = ["NEW", "Date", "Authority", "Instrument", "Practical summary", "URL", "First seen (UTC)"]
-
-    html_rows = []
-    for i, r in enumerate(rows):
-        tr_class = "wd-latest" if i == 0 else ""
-        new_class = "wd-new" if r["NEW"] == "YES" else ""
-
-        url_val = r["URL"]
-        if url_val.startswith("https://"):
-            url_html = f'<span class="wd-url"><a href="{html.escape(url_val)}" target="_blank" rel="noopener noreferrer">{html.escape(url_val)}</a></span>'
-        else:
-            url_html = html.escape(url_val)
-
-        html_rows.append(
-            f"""
-            <tr class="{tr_class}">
-              <td class="{new_class}">{html.escape(r["NEW"])}</td>
-              <td>{html.escape(r["Date"])}</td>
-              <td>{html.escape(r["Authority"])}</td>
-              <td>{html.escape(r["Instrument"])}</td>
-              <td>{html.escape(r["Practical summary"])}</td>
-              <td>{url_html}</td>
-              <td>{html.escape(r["First seen (UTC)"])}</td>
-            </tr>
-            """
+        rows.append(
+            {
+                "NEW": "YES" if _id in latest_added_ids else "",
+                "Date": it.get("date", "date unclear"),
+                "Authority": it.get("authority", ""),
+                "Instrument": it.get("instrument", ""),
+                "Practical summary": it.get("summary", ""),
+                "URL": url if url.startswith("https://") else "link unavailable",
+                "First seen (UTC)": it.get("first_seen_utc", ""),
+            }
         )
 
-    table_html = f"""
-    {css}
-    <table class="wd-table">
-      <thead>
-        <tr>
-          {''.join([f"<th>{html.escape(c)}</th>" for c in header_cols])}
-        </tr>
-      </thead>
-      <tbody>
-        {''.join(html_rows)}
-      </tbody>
-    </table>
-    """
+    df = pd.DataFrame(rows)
 
-    st.markdown(table_html, unsafe_allow_html=True)
+    # Highlight the latest row (row 0) light blue
+    def _style_latest(row_idx: int):
+        if row_idx == 0:
+            return ["background-color: #d9ecff"] * len(df.columns)
+        return [""] * len(df.columns)
+
+    styled = df.style.apply(lambda _row: _style_latest(_row.name), axis=1)
+
+    st.dataframe(
+        styled,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "URL": st.column_config.LinkColumn(
+                "URL",
+                help="Click to open",
+                validate="^https://.*|link unavailable$",
+                display_text="Open link",
+            ),
+        },
+    )
     st.caption("Top row (light blue) is the latest entry in this category. NEW=YES indicates added in the latest run.")
 
 
@@ -144,12 +112,11 @@ if auto_refresh:
 
 run_now = st.button("Run now", type="primary")
 
-# ---- Progress indicator (only) ----
+# Progress indicator (only)
 status_box = st.status("Idle", expanded=False)
 progress_bar = st.progress(0)
 
 def _progress_cb(topic: str, idx: int, total: int) -> None:
-    # idx is 1..total
     status_box.update(label=f"Running: {idx}/{total} — {topic}", state="running", expanded=False)
     pct = int((idx / max(total, 1)) * 100)
     progress_bar.progress(pct)
@@ -165,7 +132,7 @@ if run_now or auto_refresh:
         max_results_per_topic=int(max_results_per_topic),
         preferred_domains=_parse_domains(include_domains),
         window_days=int(window_days),
-        progress_callback=_progress_cb,   # <-- progress only
+        progress_callback=_progress_cb,
     )
 
     status_box.update(label=f"Run completed at {result['timestamp_utc']} UTC", state="complete", expanded=False)
@@ -190,5 +157,5 @@ st.subheader("Results (single-page scroll, newest-first per category)")
 for cat in CATEGORY_TABS_ORDER:
     st.markdown(f"### {cat}")
     cat_items = [it for it in items if isinstance(it, dict) and it.get("category") == cat]
-    _render_category_table(cat, cat_items, latest_added_ids)
+    _render_category_df(cat_items, latest_added_ids)
     st.markdown("---")
