@@ -37,7 +37,7 @@ def _render_category_df(cat_items: list, latest_added_ids: set[str]) -> None:
         st.info("No items stored for this category.")
         return
 
-    # Deduplicate defensively by id in display as well (no double rows shown)
+    # Display-level dedupe by id (defensive)
     seen = set()
     deduped = []
     for it in cat_items:
