@@ -169,17 +169,17 @@ def _search_topic(
 
 
 def _build_context(sources: List[dict], max_chars: int = 12000) -> str:
-    # Compact but richer than before: use raw_content when available.
     chunks: List[str] = []
     for s in sources:
         title = (s.get("title") or "").strip()
         url = (s.get("url") or "").strip()
         content = (s.get("content") or s.get("snippet") or "").strip()
-        body = content
+        topic = (s.get("_topic") or "").strip()
 
-        if not body:
+        if not url or not content:
             continue
 
+        body = content
         block = f"TOPIC: {topic}\nTITLE: {title}\nURL: {url}\nCONTENT:\n{body}\n"
         chunks.append(block)
 
