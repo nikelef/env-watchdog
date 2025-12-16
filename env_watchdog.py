@@ -157,10 +157,10 @@ def _search_topic(
         search_depth=search_depth,
         max_results=max_results,
         include_answer=False,
-        include_raw_content=True,
         include_images=False,
         **kwargs,
     )
+
 
     results = res.get("results", []) if isinstance(res, dict) else []
     for r in results:
@@ -174,14 +174,9 @@ def _build_context(sources: List[dict], max_chars: int = 12000) -> str:
     for s in sources:
         title = (s.get("title") or "").strip()
         url = (s.get("url") or "").strip()
-        raw = (s.get("raw_content") or "").strip()
         content = (s.get("content") or s.get("snippet") or "").strip()
-        topic = (s.get("_topic") or "").strip()
+        body = content
 
-        if not url:
-            continue
-
-        body = raw if raw else content
         if not body:
             continue
 
