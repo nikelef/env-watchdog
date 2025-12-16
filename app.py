@@ -60,7 +60,7 @@ def _groq_client() -> OpenAI:
     return OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
 
 
-def _email_paragraph_200w(item: dict) -> str:
+def _email_paragraph_300w(item: dict) -> str:
     model_id = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
     llm = _groq_client()
 
@@ -246,7 +246,7 @@ gen_drafts = st.button("Generate email draft(s) for flagged", type="secondary")
 if "drafts" not in st.session_state:
     st.session_state["drafts"] = []
 
-st.caption("Tick Flag next to any entry, then generate email drafts (1 paragraph, ~200 words).")
+st.caption("Tick Flag next to any entry, then generate email drafts (1 paragraph, ~300 words).")
 
 flagged_requests: List[dict] = []
 
@@ -302,7 +302,7 @@ if gen_drafts:
             continue
 
         try:
-            paragraph = _email_paragraph_200w(it)
+            paragraph = _email_paragraph_300w(it)
         except Exception as e:
             paragraph = f"Could not generate summary due to error: {type(e).__name__}: {e}"
 
