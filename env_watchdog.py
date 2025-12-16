@@ -333,7 +333,9 @@ def run_watchdog(
     max_results_per_topic: int = 8,
     preferred_domains: Optional[List[str]] = None,
     window_days: int = 730,
+    progress_callback=None,
 ) -> dict:
+    
     """
     Returns dict:
       {
@@ -354,8 +356,14 @@ def run_watchdog(
     # For transparency/debug, we keep a run-level additions list
     additions: List[dict] = []
 
-    for topic in CATEGORY_TABS_ORDER:
+    for i, topic in enumerate(CATEGORY_TABS_ORDER, start=1):
         guidance = TOPICS[topic]
+        if progress_callback:
+            try:
+                progress_callback(topic, i, len(CATEGORY_TABS_ORDER))
+            except Exception:
+                pass
+
 
         sources = _search_topic(
             client=tav,
