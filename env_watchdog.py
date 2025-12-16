@@ -65,19 +65,41 @@ CATEGORY_TABS_ORDER = [
     "Regional / local regimes (EU, US, AUS, etc.)",
 ]
 
+LOCAL_CATEGORY = "Regional / local regimes (EU, US, AUS, etc.)"
+
 
 # -------------------------
-# Storage (no deletions)
+# Storage (merge-only; dedupe by id)
 # -------------------------
 DATA_DIR = os.environ.get("DATA_DIR", "data")
-STATE_PATH = os.path.join(DATA_DIR, "state.json")  # single source of truth
-LATEST_RUN_PATH = os.path.join(DATA_DIR, "latest_run.json")  # just last run additions (for highlighting)
+STATE_PATH = os.path.join(DATA_DIR, "state.json")
+LATEST_RUN_PATH = os.path.join(DATA_DIR, "latest_run.json")
+
 
 def _ensure_data_dir() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
 
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _dedupe_items_keep_first(items: List[dict]) -> List[dict]:
+    """Remove duplicates by id while preserving order (first occurrence kept)."""
+    out: List[dict] = []
+    seen = set()
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        _id = it.get("id")
+        if not _id:
+            continue
+        if _id in seen:
+            continue
+        seen.add(_id)
+        out.append(it)
+    return out
+
 
 def load_state() -> dict:
     _ensure_data_dir()
@@ -85,20 +107,32 @@ def load_state() -> dict:
         return {"items": []}
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+            state = json.load(f)
+        items = state.get("items", [])
+        if isinstance(items, list):
+            deduped = _dedupe_items_keep_first(items)
+            if len(deduped) != len(items):
+                state["items"] = deduped
+                save_state(state)  # persist dedupe once (no loss of unique findings)
+        else:
+            state["items"] = []
+        return state
     except Exception:
         return {"items": []}
+
 
 def save_state(state: dict) -> None:
     _ensure_data_dir()
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=True, indent=2)
 
+
 def save_latest_run(additions: List[dict]) -> None:
     _ensure_data_dir()
     payload = {"timestamp_utc": _utc_now_iso(), "additions": additions}
     with open(LATEST_RUN_PATH, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=True, indent=2)
+
 
 def load_latest_run() -> dict:
     _ensure_data_dir()
@@ -120,6 +154,7 @@ def _tavily_client() -> TavilyClient:
         raise RuntimeError("Missing TAVILY_API_KEY environment variable.")
     return TavilyClient(api_key=key)
 
+
 def _groq_client() -> OpenAI:
     key = os.environ.get("GROQ_API_KEY", "").strip()
     if not key:
@@ -139,7 +174,6 @@ def _search_topic(
     preferred_domains: Optional[List[str]],
     window_days: int,
 ) -> List[dict]:
-    # Stronger, more targeted query. We bias toward official + recency.
     q = (
         f"{topic_name} "
         f"(amendment OR circular OR resolution OR guideline OR enforcement OR delegated act OR regulation) "
@@ -151,7 +185,6 @@ def _search_topic(
     if preferred_domains:
         kwargs["include_domains"] = preferred_domains
 
-    # include_raw_content=True provides more substance for the LLM than snippets.
     res = client.search(
         query=q,
         search_depth=search_depth,
@@ -160,7 +193,6 @@ def _search_topic(
         include_images=False,
         **kwargs,
     )
-
 
     results = res.get("results", []) if isinstance(res, dict) else []
     for r in results:
@@ -179,8 +211,7 @@ def _build_context(sources: List[dict], max_chars: int = 12000) -> str:
         if not url or not content:
             continue
 
-        body = content
-        block = f"TOPIC: {topic}\nTITLE: {title}\nURL: {url}\nCONTENT:\n{body}\n"
+        block = f"TOPIC: {topic}\nTITLE: {title}\nURL: {url}\nCONTENT:\n{content}\n"
         chunks.append(block)
 
     text = "\n\n".join(chunks).strip()
@@ -195,7 +226,7 @@ def _build_context(sources: List[dict], max_chars: int = 12000) -> str:
 SYSTEM_PROMPT = (
     "You are an Environmental Specialist Watch Dog for an international ship management company. "
     "You extract only regulatory developments within a time window defined by the user. "
-    "You prefer official sources (IMO, flags, regulators, class) and ignore older baseline rules.\n\n"
+    "Prefer official sources (IMO, flags, regulators, class) and ignore older baseline rules.\n\n"
     "Return STRICT JSON only: a JSON array of objects. No markdown. No extra text.\n"
     "Each object must have keys:\n"
     "category, authority, instrument, date, summary, url\n"
@@ -204,16 +235,15 @@ SYSTEM_PROMPT = (
     "url must be https or 'link unavailable'."
 )
 
+
 def _safe_json_loads(text: str) -> Optional[Any]:
     text = (text or "").strip()
     if not text:
         return None
-    # Attempt direct parse
     try:
         return json.loads(text)
     except Exception:
         pass
-    # Attempt to extract first JSON array from text
     start = text.find("[")
     end = text.rfind("]")
     if start != -1 and end != -1 and end > start:
@@ -223,48 +253,44 @@ def _safe_json_loads(text: str) -> Optional[Any]:
             return None
     return None
 
+
 def _normalize_item(x: dict, fallback_category: str) -> Optional[dict]:
     if not isinstance(x, dict):
         return None
 
-    category = (x.get("category") or fallback_category).strip()
-    authority = (x.get("authority") or "").strip()
-    instrument = (x.get("instrument") or "").strip()
-    date = (x.get("date") or "date unclear").strip()
-    summary = (x.get("summary") or "").strip()
-    url = (x.get("url") or "link unavailable").strip()
+    category = (x.get("category") or fallback_category).strip() or fallback_category
+    authority = (x.get("authority") or "").strip() or "authority unclear"
+    instrument = (x.get("instrument") or "").strip() or "instrument unclear"
+    date = (x.get("date") or "date unclear").strip() or "date unclear"
+    summary = (x.get("summary") or "").strip() or "summary unclear"
+    url = (x.get("url") or "link unavailable").strip() or "link unavailable"
 
-    if not category:
-        category = fallback_category
-
-    # enforce url rule
     if not (url.startswith("https://") or url == "link unavailable"):
         url = "link unavailable"
 
-    # require at least something meaningful
-    if not authority and not instrument and not summary and url == "link unavailable":
+    # If it's totally empty, skip
+    if authority == "authority unclear" and instrument == "instrument unclear" and summary == "summary unclear" and url == "link unavailable":
         return None
 
     return {
         "category": category,
-        "authority": authority or "authority unclear",
-        "instrument": instrument or "instrument unclear",
-        "date": date or "date unclear",
-        "summary": summary or "summary unclear",
+        "authority": authority,
+        "instrument": instrument,
+        "date": date,
+        "summary": summary,
         "url": url,
     }
 
+
 def _item_id(item: dict) -> str:
-    # Stable ID for dedupe: authority|instrument|date|url
     key = f"{item.get('authority','')}|{item.get('instrument','')}|{item.get('date','')}|{item.get('url','')}"
     return hashlib.sha256(key.encode("utf-8", errors="ignore")).hexdigest()[:24]
 
+
 def _date_sort_key(date_str: str) -> Tuple[int, str]:
-    # Newest first. Unknown dates go last.
     ds = (date_str or "").strip()
     if ds.lower() == "date unclear":
         return (0, "")
-    # Accept YYYY-MM-DD or YYYY-MM
     try:
         if len(ds) == 10:
             dt = datetime.strptime(ds, "%Y-%m-%d")
@@ -275,6 +301,7 @@ def _date_sort_key(date_str: str) -> Tuple[int, str]:
     except Exception:
         return (0, "")
     return (0, "")
+
 
 def _extract_updates_for_topic(
     llm: OpenAI,
@@ -319,23 +346,22 @@ def _extract_updates_for_topic(
         if norm:
             out.append(norm)
 
-    # Sort by date descending (newest first)
     out.sort(key=lambda it: _date_sort_key(it.get("date", "")), reverse=True)
     return out
 
 
 # -------------------------
-# Main runner: merge-only (no deletions)
+# Main runner: merge-only + dedupe
 # -------------------------
 def run_watchdog(
     today_utc: str,
     tavily_search_depth: str = "advanced",
     max_results_per_topic: int = 8,
+    local_results_per_topic: int = 20,
     preferred_domains: Optional[List[str]] = None,
     window_days: int = 730,
     progress_callback=None,
 ) -> dict:
-    
     """
     Returns dict:
       {
@@ -348,34 +374,38 @@ def run_watchdog(
     llm = _groq_client()
     model_id = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 
-    # Load existing persistent state (never delete)
     state = load_state()
     existing_items: List[dict] = state.get("items", [])
-    existing_by_id = {it.get("id"): it for it in existing_items if isinstance(it, dict) and it.get("id")}
+    existing_items = _dedupe_items_keep_first(existing_items)  # hard guarantee at runtime
 
-    # For transparency/debug, we keep a run-level additions list
+    existing_by_id = {it.get("id"): it for it in existing_items if isinstance(it, dict) and it.get("id")}
     additions: List[dict] = []
+
+    total = len(CATEGORY_TABS_ORDER)
 
     for i, topic in enumerate(CATEGORY_TABS_ORDER, start=1):
         guidance = TOPICS[topic]
+
         if progress_callback:
             try:
-                progress_callback(topic, i, len(CATEGORY_TABS_ORDER))
+                progress_callback(topic, i, total)
             except Exception:
                 pass
 
+        # Flexible: only local category uses a separate max_results
+        mr = int(local_results_per_topic) if topic == LOCAL_CATEGORY else int(max_results_per_topic)
 
         sources = _search_topic(
             client=tav,
             topic_name=topic,
             today_utc=today_utc,
             search_depth=tavily_search_depth,
-            max_results=max_results_per_topic,
+            max_results=mr,
             preferred_domains=preferred_domains,
             window_days=window_days,
         )
 
-        # Deduplicate sources by URL and keep a sane cap for context
+        # Deduplicate sources by URL for context
         seen_urls = set()
         uniq_sources = []
         for s in sources:
@@ -397,11 +427,9 @@ def run_watchdog(
             context=context,
         )
 
-        # Merge-only: add new items if not already present
         for item in extracted:
             item_id = _item_id(item)
             if item_id in existing_by_id:
-                # touch last_seen (no deletion/modification of core content)
                 existing_by_id[item_id]["last_seen_utc"] = _utc_now_iso()
                 continue
 
@@ -410,17 +438,13 @@ def run_watchdog(
             new_item["first_seen_utc"] = _utc_now_iso()
             new_item["last_seen_utc"] = new_item["first_seen_utc"]
 
-            # Insert new items at the beginning (newest additions on top)
             existing_items.insert(0, new_item)
             existing_by_id[item_id] = new_item
             additions.append(new_item)
 
-    # Global sort in storage: newest date first, unknown last.
-    # Note: stable (inserted additions already on top), but we also sort for long-term sanity.
-    existing_items.sort(
-        key=lambda it: _date_sort_key((it or {}).get("date", "")),
-        reverse=True,
-    )
+    # Sort newest first by date; unknown last
+    existing_items = _dedupe_items_keep_first(existing_items)
+    existing_items.sort(key=lambda it: _date_sort_key((it or {}).get("date", "")), reverse=True)
 
     state["items"] = existing_items
     save_state(state)
