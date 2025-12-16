@@ -9,9 +9,6 @@ from openai import OpenAI
 from tavily import TavilyClient
 
 
-# -------------------------
-# Categories / Topics
-# -------------------------
 TOPICS: Dict[str, str] = {
     "MARPOL Annex I – Oil": (
         "Monitor only recent changes, amendments, circulars or implementation guidance relevant "
@@ -68,9 +65,6 @@ CATEGORY_TABS_ORDER = [
 LOCAL_CATEGORY = "Regional / local regimes (EU, US, AUS, etc.)"
 
 
-# -------------------------
-# Storage (merge-only; dedupe)
-# -------------------------
 DATA_DIR = os.environ.get("DATA_DIR", "data")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
 LATEST_RUN_PATH = os.path.join(DATA_DIR, "latest_run.json")
@@ -85,7 +79,6 @@ def _utc_now_iso() -> str:
 
 
 def _dedupe_items_keep_first_by_id(items: List[dict]) -> List[dict]:
-    """Remove duplicates by item['id'] while preserving order (first occurrence kept)."""
     out: List[dict] = []
     seen = set()
     for it in items:
@@ -114,7 +107,6 @@ def load_state() -> dict:
             state["items"] = []
             return state
 
-        # Light cleanup on load (id-based)
         deduped = _dedupe_items_keep_first_by_id(items)
         if len(deduped) != len(items):
             state["items"] = deduped
@@ -149,9 +141,6 @@ def load_latest_run() -> dict:
         return {"timestamp_utc": None, "additions": []}
 
 
-# -------------------------
-# Clients
-# -------------------------
 def _tavily_client() -> TavilyClient:
     key = os.environ.get("TAVILY_API_KEY", "").strip()
     if not key:
@@ -166,9 +155,6 @@ def _groq_client() -> OpenAI:
     return OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
 
 
-# -------------------------
-# Retrieval
-# -------------------------
 def _search_topic(
     client: TavilyClient,
     topic_name: str,
@@ -224,9 +210,6 @@ def _build_context(sources: List[dict], max_chars: int = 12000) -> str:
     return text[:max_chars] + "\n\n(TRUNCATED)\n"
 
 
-# -------------------------
-# LLM extraction (JSON)
-# -------------------------
 SYSTEM_PROMPT = (
     "You are an Environmental Specialist Watch Dog for an international ship management company. "
     "You extract only regulatory developments within a time window defined by the user. "
@@ -274,10 +257,7 @@ def _normalize_item(x: dict, fallback_category: str) -> Optional[dict]:
     if not (url.startswith("https://") or url == "link unavailable"):
         url = "link unavailable"
 
-    if authority == "authority unclear" and instrument == "instrument unclear" and summary == "summary unclear" and url == "link unavailable":
-        return None
-
-    # Ensure exactly 2 lines for the UI column
+    # enforce exactly 2 lines
     summary_lines = [ln.strip() for ln in summary.splitlines() if ln.strip()]
     if len(summary_lines) >= 2:
         summary = summary_lines[0] + "\n" + summary_lines[1]
@@ -285,6 +265,9 @@ def _normalize_item(x: dict, fallback_category: str) -> Optional[dict]:
         summary = summary_lines[0] + "\n" + "Action: Review/implement and update documentation as applicable."
     else:
         summary = "summary unclear\nAction: Review/implement and update documentation as applicable."
+
+    if authority == "authority unclear" and instrument == "instrument unclear" and summary.startswith("summary unclear") and url == "link unavailable":
+        return None
 
     return {
         "category": category,
@@ -364,9 +347,6 @@ def _extract_updates_for_topic(
     return out
 
 
-# -------------------------
-# Canonical dedupe (URL+instrument first)
-# -------------------------
 def _canon_text(x: str) -> str:
     x = (x or "").strip().lower()
     x = " ".join(x.split())
@@ -409,33 +389,6 @@ def _dedupe_items_canonical(items: List[dict]) -> List[dict]:
     return out
 
 
-# -------------------------
-# 60-day alert flag
-# -------------------------
-def _is_within_days(date_str: str, today_utc: str, days: int) -> bool:
-    try:
-        today = datetime.strptime(today_utc, "%Y-%m-%d")
-    except Exception:
-        return False
-
-    ds = (date_str or "").strip()
-    try:
-        if len(ds) == 10:
-            dt = datetime.strptime(ds, "%Y-%m-%d")
-        elif len(ds) == 7:
-            dt = datetime.strptime(ds, "%Y-%m")
-        else:
-            return False
-    except Exception:
-        return False
-
-    delta = (today - dt).days
-    return 0 <= delta <= days
-
-
-# -------------------------
-# Main runner
-# -------------------------
 def run_watchdog(
     today_utc: str,
     tavily_search_depth: str = "advanced",
@@ -512,13 +465,11 @@ def run_watchdog(
             new_item["id"] = item_id
             new_item["first_seen_utc"] = _utc_now_iso()
             new_item["last_seen_utc"] = new_item["first_seen_utc"]
-            new_item["alert_60d"] = _is_within_days(new_item.get("date", ""), today_utc, 60)
 
             existing_items.insert(0, new_item)
             existing_by_id[item_id] = new_item
             additions.append(new_item)
 
-    # Sort newest-first and dedupe
     existing_items = _dedupe_items_keep_first_by_id(existing_items)
     existing_items.sort(key=lambda it: _date_sort_key((it or {}).get("date", "")), reverse=True)
     existing_items = _dedupe_items_canonical(existing_items)
