@@ -1,14 +1,19 @@
 import os
 import json
 import hashlib
+import re
+import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Tuple
 
-import streamlit as st
+import requests
 from openai import OpenAI
 from tavily import TavilyClient
 
 
+# -------------------------
+# Categories / Topics
+# -------------------------
 TOPICS: Dict[str, str] = {
     "MARPOL Annex I – Oil": (
         "Monitor only recent changes, amendments, circulars or implementation guidance relevant "
@@ -65,9 +70,13 @@ CATEGORY_TABS_ORDER = [
 LOCAL_CATEGORY = "Regional / local regimes (EU, US, AUS, etc.)"
 
 
+# -------------------------
+# Storage (merge-only; dedupe; cache)
+# -------------------------
 DATA_DIR = os.environ.get("DATA_DIR", "data")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
 LATEST_RUN_PATH = os.path.join(DATA_DIR, "latest_run.json")
+FETCH_CACHE_PATH = os.path.join(DATA_DIR, "fetch_cache.json")
 
 
 def _ensure_data_dir() -> None:
@@ -101,17 +110,14 @@ def load_state() -> dict:
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             state = json.load(f)
-
         items = state.get("items", [])
         if not isinstance(items, list):
             state["items"] = []
             return state
-
         deduped = _dedupe_items_keep_first_by_id(items)
         if len(deduped) != len(items):
             state["items"] = deduped
             save_state(state)
-
         return state
     except Exception:
         return {"items": []}
@@ -141,6 +147,27 @@ def load_latest_run() -> dict:
         return {"timestamp_utc": None, "additions": []}
 
 
+def _load_fetch_cache() -> dict:
+    _ensure_data_dir()
+    if not os.path.exists(FETCH_CACHE_PATH):
+        return {}
+    try:
+        with open(FETCH_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_fetch_cache(cache: dict) -> None:
+    _ensure_data_dir()
+    with open(FETCH_CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=True, indent=2)
+
+
+# -------------------------
+# Clients
+# -------------------------
 def _tavily_client() -> TavilyClient:
     key = os.environ.get("TAVILY_API_KEY", "").strip()
     if not key:
@@ -155,10 +182,12 @@ def _groq_client() -> OpenAI:
     return OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
 
 
+# -------------------------
+# Retrieval: search + fetch full page text
+# -------------------------
 def _search_topic(
     client: TavilyClient,
     topic_name: str,
-    today_utc: str,
     search_depth: str,
     max_results: int,
     preferred_domains: Optional[List[str]],
@@ -167,10 +196,9 @@ def _search_topic(
     q = (
         f"{topic_name} "
         f"(amendment OR circular OR resolution OR guideline OR enforcement OR delegated act OR regulation) "
-        f"(MEPC OR IMO OR flag circular OR class technical news OR EU Commission OR USCG OR AMSA OR CARB) "
+        f"(IMO OR MEPC OR flag circular OR port state OR regulator OR class technical news) "
         f"last {window_days} days"
     )
-
     kwargs = {}
     if preferred_domains:
         kwargs["include_domains"] = preferred_domains
@@ -183,45 +211,117 @@ def _search_topic(
         include_images=False,
         **kwargs,
     )
-
     results = res.get("results", []) if isinstance(res, dict) else []
     for r in results:
         r["_topic"] = topic_name
     return results
 
 
-def _build_context(sources: List[dict], max_chars: int = 12000) -> str:
+def _strip_html(html: str) -> str:
+    # Remove script/style
+    html = re.sub(r"(?is)<script.*?>.*?</script>", " ", html)
+    html = re.sub(r"(?is)<style.*?>.*?</style>", " ", html)
+    # Remove tags
+    text = re.sub(r"(?s)<[^>]+>", " ", html)
+    # Normalize whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _fetch_url_text(
+    url: str,
+    cache: dict,
+    cache_ttl_hours: int,
+    timeout_sec: int,
+    max_chars: int,
+    polite_delay_sec: float,
+) -> str:
+    if not isinstance(url, str) or not url.startswith("https://"):
+        return ""
+
+    now = datetime.now(timezone.utc)
+    cached = cache.get(url)
+    if isinstance(cached, dict):
+        ts = cached.get("fetched_at_utc")
+        body = cached.get("text", "")
+        if ts and body:
+            try:
+                dt = datetime.fromisoformat(ts)
+                age_hours = (now - dt).total_seconds() / 3600.0
+                if age_hours <= float(cache_ttl_hours):
+                    return str(body)[:max_chars]
+            except Exception:
+                pass
+
+    # polite delay to reduce rate-limiting / blocks
+    if polite_delay_sec > 0:
+        time.sleep(polite_delay_sec)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; EnvWatchdog/1.0; +https://example.invalid)"
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=timeout_sec)
+        if r.status_code >= 400:
+            return ""
+        content_type = (r.headers.get("content-type") or "").lower()
+
+        if "pdf" in content_type or url.lower().endswith(".pdf"):
+            # No PDF parsing here (avoids heavy deps). Keep snippet only.
+            return ""
+
+        html = r.text or ""
+        text = _strip_html(html)
+        text = text[:max_chars].strip()
+
+        if text:
+            cache[url] = {"fetched_at_utc": now.isoformat(timespec="seconds"), "text": text}
+        return text
+    except Exception:
+        return ""
+
+
+def _build_context_from_sources(
+    sources: List[dict],
+    fulltexts: Dict[str, str],
+    max_total_chars: int,
+) -> str:
     chunks: List[str] = []
+    total = 0
+
     for s in sources:
+        topic = (s.get("_topic") or "").strip()
         title = (s.get("title") or "").strip()
         url = (s.get("url") or "").strip()
-        content = (s.get("content") or s.get("snippet") or "").strip()
-        topic = (s.get("_topic") or "").strip()
+        snippet = (s.get("content") or s.get("snippet") or "").strip()
 
-        if not url or not content:
+        if not url:
             continue
 
-        block = f"TOPIC: {topic}\nTITLE: {title}\nURL: {url}\nCONTENT:\n{content}\n"
+        body = fulltexts.get(url) or ""
+        # Fallback to snippet if no full text
+        if not body:
+            body = snippet
+
+        if not body:
+            continue
+
+        block = f"TOPIC: {topic}\nTITLE: {title}\nURL: {url}\nCONTENT:\n{body}\n"
+        if total + len(block) > max_total_chars:
+            break
         chunks.append(block)
+        total += len(block)
 
-    text = "\n\n".join(chunks).strip()
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars] + "\n\n(TRUNCATED)\n"
+    return "\n\n".join(chunks).strip()
 
 
-SYSTEM_PROMPT = (
-    "You are an Environmental Specialist Watch Dog for an international ship management company. "
-    "You extract only regulatory developments within a time window defined by the user. "
-    "Prefer official sources (IMO, flags, regulators, class) and ignore older baseline rules.\n\n"
-    "Return STRICT JSON only: a JSON array of objects. No markdown. No extra text.\n"
-    "Each object must have keys:\n"
-    "category, authority, instrument, date, summary, url\n"
-    "date must be 'YYYY-MM-DD' if known; else 'date unclear'.\n"
-    "summary MUST be exactly 2 lines (two sentences max total), practical and action-oriented: "
-    "line 1 = operational impact; line 2 = documentation/survey/inspection action. "
-    "Separate the two lines with a newline character (\\n). Do not use bullet symbols.\n"
-    "url must be https or 'link unavailable'."
+# -------------------------
+# LLM: rerank sources + extract structured updates
+# -------------------------
+RERANK_SYSTEM = (
+    "You are selecting best primary sources for maritime environmental regulatory updates. "
+    "Prefer official/primary sources (IMO, flags, regulators, class). Prefer items that are clearly "
+    "recent within the provided window. Avoid blogs or low-quality sites."
 )
 
 
@@ -241,6 +341,92 @@ def _safe_json_loads(text: str) -> Optional[Any]:
         except Exception:
             return None
     return None
+
+
+def _rerank_sources(
+    llm: OpenAI,
+    model_id: str,
+    topic: str,
+    window_days: int,
+    sources: List[dict],
+    k: int,
+) -> List[dict]:
+    """
+    Two-pass improvement: use LLM to pick top K URLs likely to be primary + recent.
+    Falls back to Tavily score ordering if LLM fails.
+    """
+    if not sources:
+        return []
+
+    # Build compact list
+    mini = []
+    for s in sources[:50]:
+        mini.append(
+            {
+                "title": (s.get("title") or "")[:180],
+                "url": s.get("url") or "",
+                "snippet": (s.get("content") or s.get("snippet") or "")[:240],
+                "score": s.get("score", None),
+            }
+        )
+
+    prompt = (
+        f"Topic: {topic}\n"
+        f"Window: last {window_days} days\n"
+        f"Select the best {k} sources (URLs) to extract regulatory updates.\n"
+        f"Return ONLY a JSON array of URLs (strings). No other text.\n\n"
+        f"Candidates:\n{json.dumps(mini, ensure_ascii=True)}"
+    )
+
+    try:
+        resp = llm.chat.completions.create(
+            model=model_id,
+            messages=[
+                {"role": "system", "content": RERANK_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        arr = _safe_json_loads(raw)
+        if isinstance(arr, list):
+            wanted = [u for u in arr if isinstance(u, str) and u.startswith("http")]
+            wanted_set = set(wanted)
+            out = [s for s in sources if (s.get("url") or "") in wanted_set]
+            # Keep order of wanted list
+            out_sorted = []
+            by_url = {s.get("url"): s for s in out}
+            for u in wanted:
+                if u in by_url:
+                    out_sorted.append(by_url[u])
+            return out_sorted[:k]
+    except Exception:
+        pass
+
+    # fallback: highest score first if present
+    def _score(s):
+        v = s.get("score")
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+
+    return sorted(sources, key=_score, reverse=True)[:k]
+
+
+EXTRACT_SYSTEM = (
+    "You are an Environmental Specialist Watch Dog for an international ship management company. "
+    "You extract only regulatory developments within a time window defined by the user. "
+    "Prefer official sources (IMO, flags, regulators, class) and ignore older baseline rules.\n\n"
+    "Return STRICT JSON only: a JSON array of objects. No markdown. No extra text.\n"
+    "Each object must have keys:\n"
+    "category, authority, instrument, date, summary, url\n"
+    "date must be 'YYYY-MM-DD' if known; else 'date unclear'.\n"
+    "summary MUST be exactly 2 lines (two sentences max total), practical and action-oriented: "
+    "line 1 = operational impact; line 2 = documentation/survey/inspection action. "
+    "Separate the two lines with a newline character (\\n). Do not use bullet symbols.\n"
+    "url must be https or 'link unavailable'."
+)
 
 
 def _normalize_item(x: dict, fallback_category: str) -> Optional[dict]:
@@ -300,7 +486,7 @@ def _date_sort_key(date_str: str) -> Tuple[int, str]:
     return (0, "")
 
 
-def _extract_updates_for_topic(
+def _extract_updates(
     llm: OpenAI,
     model_id: str,
     topic_name: str,
@@ -323,14 +509,13 @@ def _extract_updates_for_topic(
         resp = llm.chat.completions.create(
             model=model_id,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": EXTRACT_SYSTEM},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.1,
         )
         raw = (resp.choices[0].message.content or "").strip()
-    except Exception as e:
-        st.error(f"LLM request failed for '{topic_name}': {type(e).__name__}: {e}")
+    except Exception:
         return []
 
     parsed = _safe_json_loads(raw)
@@ -347,6 +532,9 @@ def _extract_updates_for_topic(
     return out
 
 
+# -------------------------
+# Canonical dedupe (URL+instrument first)
+# -------------------------
 def _canon_text(x: str) -> str:
     x = (x or "").strip().lower()
     x = " ".join(x.split())
@@ -389,18 +577,31 @@ def _dedupe_items_canonical(items: List[dict]) -> List[dict]:
     return out
 
 
+# -------------------------
+# Main runner (multi-pass + fulltext fetch + cache)
+# -------------------------
 def run_watchdog(
     today_utc: str,
     tavily_search_depth: str = "advanced",
-    max_results_per_topic: int = 8,
-    local_results_per_topic: int = 20,
+    max_results_per_topic: int = 12,
+    local_results_per_topic: int = 30,
     preferred_domains: Optional[List[str]] = None,
     window_days: int = 730,
+    # quality knobs:
+    rerank_top_k: int = 10,
+    fetch_fulltext_top_k: int = 6,
+    fetch_timeout_sec: int = 20,
+    fetch_cache_ttl_hours: int = 72,
+    fetch_max_chars_per_url: int = 12000,
+    context_max_total_chars: int = 45000,
+    polite_delay_sec: float = 0.4,
     progress_callback=None,
 ) -> dict:
     tav = _tavily_client()
     llm = _groq_client()
     model_id = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+
+    cache = _load_fetch_cache()
 
     state = load_state()
     existing_items: List[dict] = state.get("items", [])
@@ -418,7 +619,7 @@ def run_watchdog(
 
         if progress_callback:
             try:
-                progress_callback(topic, i, total)
+                progress_callback(topic, i, total, "search")
             except Exception:
                 pass
 
@@ -427,25 +628,78 @@ def run_watchdog(
         sources = _search_topic(
             client=tav,
             topic_name=topic,
-            today_utc=today_utc,
             search_depth=tavily_search_depth,
             max_results=mr,
             preferred_domains=preferred_domains,
             window_days=window_days,
         )
 
+        # Deduplicate by URL
         seen_urls = set()
-        uniq_sources = []
+        uniq = []
         for s in sources:
             u = (s.get("url") or "").strip()
             if not u or u in seen_urls:
                 continue
             seen_urls.add(u)
-            uniq_sources.append(s)
+            uniq.append(s)
 
-        context = _build_context(uniq_sources, max_chars=12000)
+        if progress_callback:
+            try:
+                progress_callback(topic, i, total, "rerank")
+            except Exception:
+                pass
 
-        extracted = _extract_updates_for_topic(
+        # Pass 2: rerank to pick best primary/recent sources
+        selected = _rerank_sources(
+            llm=llm,
+            model_id=model_id,
+            topic=topic,
+            window_days=window_days,
+            sources=uniq,
+            k=int(rerank_top_k),
+        )
+
+        if progress_callback:
+            try:
+                progress_callback(topic, i, total, "fetch")
+            except Exception:
+                pass
+
+        # Fetch full text for top N sources (cached)
+        fulltexts: Dict[str, str] = {}
+        for s in selected[: int(fetch_fulltext_top_k)]:
+            url = (s.get("url") or "").strip()
+            if not url:
+                continue
+            txt = _fetch_url_text(
+                url=url,
+                cache=cache,
+                cache_ttl_hours=int(fetch_cache_ttl_hours),
+                timeout_sec=int(fetch_timeout_sec),
+                max_chars=int(fetch_max_chars_per_url),
+                polite_delay_sec=float(polite_delay_sec),
+            )
+            if txt:
+                fulltexts[url] = txt
+
+        # Persist cache periodically
+        _save_fetch_cache(cache)
+
+        if progress_callback:
+            try:
+                progress_callback(topic, i, total, "extract")
+            except Exception:
+                pass
+
+        # Build richer context and extract structured items
+        context = _build_context_from_sources(
+            sources=selected,
+            fulltexts=fulltexts,
+            max_total_chars=int(context_max_total_chars),
+        )
+
+        extracted = _extract_updates(
             llm=llm,
             model_id=model_id,
             topic_name=topic,
