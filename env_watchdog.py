@@ -69,7 +69,7 @@ LOCAL_CATEGORY = "Regional / local regimes (EU, US, AUS, etc.)"
 
 
 # -------------------------
-# Storage (merge-only; dedupe by id)
+# Storage (merge-only; dedupe)
 # -------------------------
 DATA_DIR = os.environ.get("DATA_DIR", "data")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
@@ -84,8 +84,8 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _dedupe_items_keep_first(items: List[dict]) -> List[dict]:
-    """Remove duplicates by id while preserving order (first occurrence kept)."""
+def _dedupe_items_keep_first_by_id(items: List[dict]) -> List[dict]:
+    """Remove duplicates by item['id'] while preserving order (first occurrence kept)."""
     out: List[dict] = []
     seen = set()
     for it in items:
@@ -108,14 +108,18 @@ def load_state() -> dict:
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             state = json.load(f)
+
         items = state.get("items", [])
-        if isinstance(items, list):
-            deduped = _dedupe_items_keep_first(items)
-            if len(deduped) != len(items):
-                state["items"] = deduped
-                save_state(state)  # persist dedupe once (no loss of unique findings)
-        else:
+        if not isinstance(items, list):
             state["items"] = []
+            return state
+
+        # Light cleanup on load (id-based) to prevent runaway duplication.
+        deduped = _dedupe_items_keep_first_by_id(items)
+        if len(deduped) != len(items):
+            state["items"] = deduped
+            save_state(state)
+
         return state
     except Exception:
         return {"items": []}
@@ -268,7 +272,6 @@ def _normalize_item(x: dict, fallback_category: str) -> Optional[dict]:
     if not (url.startswith("https://") or url == "link unavailable"):
         url = "link unavailable"
 
-    # If it's totally empty, skip
     if authority == "authority unclear" and instrument == "instrument unclear" and summary == "summary unclear" and url == "link unavailable":
         return None
 
@@ -351,7 +354,58 @@ def _extract_updates_for_topic(
 
 
 # -------------------------
-# Main runner: merge-only + dedupe
+# Canonical dedupe (URL-first)
+# -------------------------
+def _canon_text(x: str) -> str:
+    x = (x or "").strip().lower()
+    x = " ".join(x.split())
+    return x
+
+
+def _canon_url(url: str) -> str:
+    url = (url or "").strip()
+    if not url.startswith("https://"):
+        return ""
+    if url.endswith("/"):
+        url = url[:-1]
+    return url
+
+
+def _dedupe_key(item: dict) -> str:
+    """
+    SAFE variant:
+    - Prefer URL + instrument (so one page that mentions multiple instruments does not collapse everything).
+    - Fallback: authority|instrument|date
+    """
+    url = _canon_url(item.get("url", ""))
+    instrument = _canon_text(item.get("instrument", ""))
+    if url:
+        return f"url:{url}|inst:{instrument}"
+    authority = _canon_text(item.get("authority", ""))
+    date = _canon_text(item.get("date", ""))
+    return f"aid:{authority}|{instrument}|{date}"
+
+
+def _dedupe_items_canonical(items: List[dict]) -> List[dict]:
+    """Remove duplicates using _dedupe_key(). Keeps first occurrence (newest/top)."""
+    out: List[dict] = []
+    seen = set()
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        k = _dedupe_key(it)
+        if not k:
+            out.append(it)
+            continue
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(it)
+    return out
+
+
+# -------------------------
+# Main runner: merge-only + FINAL dedupe pass
 # -------------------------
 def run_watchdog(
     today_utc: str,
@@ -362,25 +416,20 @@ def run_watchdog(
     window_days: int = 730,
     progress_callback=None,
 ) -> dict:
-    """
-    Returns dict:
-      {
-        "timestamp_utc": "...",
-        "added": [items...],        # new additions in this run
-        "all_items": [items...],    # full state after merge
-      }
-    """
     tav = _tavily_client()
     llm = _groq_client()
     model_id = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 
     state = load_state()
     existing_items: List[dict] = state.get("items", [])
-    existing_items = _dedupe_items_keep_first(existing_items)  # hard guarantee at runtime
+    if not isinstance(existing_items, list):
+        existing_items = []
 
+    # Ensure id-based uniqueness before merge
+    existing_items = _dedupe_items_keep_first_by_id(existing_items)
     existing_by_id = {it.get("id"): it for it in existing_items if isinstance(it, dict) and it.get("id")}
-    additions: List[dict] = []
 
+    additions: List[dict] = []
     total = len(CATEGORY_TABS_ORDER)
 
     for i, topic in enumerate(CATEGORY_TABS_ORDER, start=1):
@@ -392,7 +441,6 @@ def run_watchdog(
             except Exception:
                 pass
 
-        # Flexible: only local category uses a separate max_results
         mr = int(local_results_per_topic) if topic == LOCAL_CATEGORY else int(max_results_per_topic)
 
         sources = _search_topic(
@@ -442,9 +490,12 @@ def run_watchdog(
             existing_by_id[item_id] = new_item
             additions.append(new_item)
 
-    # Sort newest first by date; unknown last
-    existing_items = _dedupe_items_keep_first(existing_items)
+    # Sort newest-first by date (unknown last)
+    existing_items = _dedupe_items_keep_first_by_id(existing_items)
     existing_items.sort(key=lambda it: _date_sort_key((it or {}).get("date", "")), reverse=True)
+
+    # FINAL canonical dedupe to remove "same finding" variants
+    existing_items = _dedupe_items_canonical(existing_items)
 
     state["items"] = existing_items
     save_state(state)
