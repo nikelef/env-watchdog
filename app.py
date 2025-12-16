@@ -12,6 +12,8 @@ from env_watchdog import (
     LOCAL_CATEGORY,
 )
 
+ALERT_RECIPIENT = "neleftheriou@tms-dry.com"
+
 st.set_page_config(page_title="Environmental Watch Dog", layout="wide")
 st.title("Environmental Watch Dog")
 st.caption("2-year window, per-category, collapsible, newest first, merge-only (no deletions).")
@@ -32,12 +34,36 @@ def _today_utc_iso(today_override: str) -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
+def build_email_draft(alert_items: list, recipient: str, today_utc: str) -> tuple[str, str]:
+    subject = f"Environmental regulatory update(s) - last 60 days - {today_utc}"
+    lines = []
+    lines.append(f"To: {recipient}")
+    lines.append(f"Subject: {subject}")
+    lines.append("")
+    lines.append("Dear all,")
+    lines.append("")
+    lines.append("Please find below the recent regulatory development(s) identified within the last 60 days:")
+    lines.append("")
+    for it in alert_items[:10]:
+        summary = (it.get("summary") or "").replace("\n", " ").strip()
+        url = it.get("url") or "link unavailable"
+        authority = it.get("authority") or "authority unclear"
+        instrument = it.get("instrument") or "instrument unclear"
+        date = it.get("date") or "date unclear"
+        lines.append(f"- {authority} / {instrument} / {date}: {summary} Link: {url}")
+    lines.append("")
+    lines.append("Best regards,")
+    lines.append("Villager")
+    body = "\n".join(lines)
+    return subject, body
+
+
 def _render_category_df(cat_items: list, latest_added_ids: set[str]) -> None:
     if not cat_items:
         st.info("No items stored for this category.")
         return
 
-    # Display-level dedupe by id (defensive)
+    # Defensive dedupe by id in display
     seen = set()
     deduped = []
     for it in cat_items:
@@ -123,12 +149,12 @@ with st.sidebar:
     include_domains = st.text_area(
         "Preferred domains (optional, comma-separated)",
         value=os.environ.get("PREFERRED_DOMAINS", ""),
-        help="Example: imo.org, europa.eu, amsa.gov.au, uscg.mil, epa.gov, carbc.ca.gov, dnv.com, lr.org, iacs.org.uk, classnk.or.jp, bureauveritas.gr, ccs.org.cn, ww2.eagle.org, classnk.com, krs.co.kr, rina.org,   ",
+        help="Example: imo.org, europa.eu, amsa.gov.au, uscg.mil, epa.gov, carbc.ca.gov, dnv.com, lr.org",
     )
 
     st.divider()
     auto_refresh = st.checkbox("Auto-refresh", value=False)
-    refresh_minutes = st.number_input("Auto-refresh interval (minutes)", min_value=30, max_value=24 * 60, value=120)
+    refresh_minutes = st.number_input("Auto-refresh interval (minutes)", min_value=5, max_value=24 * 60, value=120)
 
     st.divider()
     st.caption("Streamlit Cloud Secrets required:")
@@ -148,8 +174,9 @@ def _progress_cb(topic: str, idx: int, total: int) -> None:
     pct = int((idx / max(total, 1)) * 100)
     progress_bar.progress(pct)
 
+today_utc = _today_utc_iso(today_override)
+
 if run_now or auto_refresh:
-    today_utc = _today_utc_iso(today_override)
     status_box.update(label="Starting run…", state="running", expanded=False)
     progress_bar.progress(0)
 
@@ -179,6 +206,13 @@ items = state.get("items", [])
 if not items:
     st.info("No stored items yet. Click 'Run now'.")
     st.stop()
+
+# Email draft block (within 60 days)
+alert_items = [it for it in items if isinstance(it, dict) and it.get("alert_60d") is True]
+if alert_items:
+    st.warning(f"ALERT: {len(alert_items)} item(s) dated within the last 60 days.")
+    subj, draft = build_email_draft(alert_items, ALERT_RECIPIENT, today_utc)
+    st.text_area("Email draft (copy/paste)", value=draft, height=260)
 
 st.subheader("Results (click category to expand/collapse)")
 
