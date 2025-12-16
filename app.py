@@ -9,11 +9,12 @@ from env_watchdog import (
     load_state,
     load_latest_run,
     CATEGORY_TABS_ORDER,
+    LOCAL_CATEGORY,
 )
 
 st.set_page_config(page_title="Environmental Watch Dog", layout="wide")
 st.title("Environmental Watch Dog")
-st.caption("2-year window, per-category lists, newest first, merge-only (no deletions).")
+st.caption("2-year window, per-category, collapsible, newest first, merge-only (no deletions).")
 
 
 def _parse_domains(raw: str):
@@ -36,8 +37,18 @@ def _render_category_df(cat_items: list, latest_added_ids: set[str]) -> None:
         st.info("No items stored for this category.")
         return
 
-    rows = []
+    # Deduplicate defensively by id in display as well (no double rows shown)
+    seen = set()
+    deduped = []
     for it in cat_items:
+        _id = it.get("id")
+        if not _id or _id in seen:
+            continue
+        seen.add(_id)
+        deduped.append(it)
+
+    rows = []
+    for it in deduped:
         _id = it.get("id", "")
         url = it.get("url", "link unavailable")
         if not isinstance(url, str):
@@ -86,17 +97,33 @@ with st.sidebar:
 
     today_override = st.text_input("Today override (YYYY-MM-DD, optional)", value=os.environ.get("TODAY_OVERRIDE", ""))
     window_days = st.number_input(
-        "Lookback window (days)", min_value=30, max_value=3650, value=int(os.environ.get("WINDOW_DAYS", "730"))
+        "Lookback window (days)",
+        min_value=30,
+        max_value=3650,
+        value=int(os.environ.get("WINDOW_DAYS", "730")),
     )
-    max_results_per_topic = st.number_input(
-        "Tavily results per topic", min_value=3, max_value=15, value=int(os.environ.get("MAX_RESULTS_PER_TOPIC", "8"))
-    )
+
     search_depth = st.selectbox("Tavily search depth", ["basic", "advanced"], index=1)
+
+    max_results_per_topic = st.number_input(
+        "Tavily results per topic (all categories except Local/Regional)",
+        min_value=3,
+        max_value=15,
+        value=int(os.environ.get("MAX_RESULTS_PER_TOPIC", "8")),
+    )
+
+    local_results_per_topic = st.number_input(
+        "Tavily results per topic (Local/Regional only)",
+        min_value=5,
+        max_value=40,
+        value=int(os.environ.get("LOCAL_RESULTS_PER_TOPIC", "20")),
+        help=f"Applies only to: {LOCAL_CATEGORY}",
+    )
 
     include_domains = st.text_area(
         "Preferred domains (optional, comma-separated)",
         value=os.environ.get("PREFERRED_DOMAINS", ""),
-        help="Example: imo.org, europa.eu, amsa.gov.au, uscg.mil, dnv.com, lr.org, bv.com",
+        help="Example: imo.org, europa.eu, amsa.gov.au, uscg.mil, epa.gov, carbc.ca.gov, dnv.com, lr.org",
     )
 
     st.divider()
@@ -112,7 +139,7 @@ if auto_refresh:
 
 run_now = st.button("Run now", type="primary")
 
-# Progress indicator (only)
+# Progress indicator
 status_box = st.status("Idle", expanded=False)
 progress_bar = st.progress(0)
 
@@ -130,6 +157,7 @@ if run_now or auto_refresh:
         today_utc=today_utc,
         tavily_search_depth=search_depth,
         max_results_per_topic=int(max_results_per_topic),
+        local_results_per_topic=int(local_results_per_topic),
         preferred_domains=_parse_domains(include_domains),
         window_days=int(window_days),
         progress_callback=_progress_cb,
@@ -152,10 +180,9 @@ if not items:
     st.info("No stored items yet. Click 'Run now'.")
     st.stop()
 
-st.subheader("Results (single-page scroll, newest-first per category)")
+st.subheader("Results (click category to expand/collapse)")
 
 for cat in CATEGORY_TABS_ORDER:
-    st.markdown(f"### {cat}")
     cat_items = [it for it in items if isinstance(it, dict) and it.get("category") == cat]
-    _render_category_df(cat_items, latest_added_ids)
-    st.markdown("---")
+    with st.expander(f"{cat} ({len(cat_items)})", expanded=False):
+        _render_category_df(cat_items, latest_added_ids)
