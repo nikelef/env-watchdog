@@ -235,7 +235,9 @@ SYSTEM_PROMPT = (
     "Each object must have keys:\n"
     "category, authority, instrument, date, summary, url\n"
     "date must be 'YYYY-MM-DD' if known; else 'date unclear'.\n"
-    "summary must be short and practical (operations/docs/surveys/inspections).\n"
+    "summary MUST be exactly 2 lines (two sentences max total), practical and action-oriented: "
+    "line 1 = operational impact; line 2 = documentation/survey/inspection action. "
+    "Separate the two lines with a newline character (\\n). Do not use bullet symbols.\n"
     "url must be https or 'link unavailable'."
 )
 
