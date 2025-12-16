@@ -1,203 +1,124 @@
 import os
 import json
+import hashlib
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any, Tuple
 
 import streamlit as st
 from openai import OpenAI
 from tavily import TavilyClient
 
 
-SYSTEM_PROMPT = """
-You are an Environmental Specialist Watch Dog for an international ship management
-company. Your task is to monitor and summarize environmental regulations applicable
-to seagoing ships, with particular focus on very recent developments only.
-
-Scope of monitoring:
-
-- All MARPOL Annexes (I–VI)
-- Ballast Water Management Convention (BWM)
-- Anti-fouling Systems Convention (AFS)
-- Ship Energy Efficiency and GHG (EEXI, CII, IMO GHG Strategy)
-- Regional / local regimes (EU, US, Australia, California, etc.), where relevant.
-
-Temporal focus (critical):
-
-- You are called periodically.
-- For each call, concentrate exclusively on regulatory developments that are NEW,
-  AMENDED, newly ANNOUNCED, or newly ENFORCED within the last 365 days relative
-  to the "today" date given in the user message.
-- Ignore older history except where strictly necessary to say what has changed.
-- Do NOT explain the full baseline requirements; assume the user already knows
-  the main conventions and regulations.
-
-Source priority (critical):
-
-When identifying recent developments, prioritise sources in this order:
-
-1) IMO official documents and circulars (MEPC resolutions, amendments, guidelines, circulars).
-2) Flag State circulars and notices (e.g. Marshall Islands, Liberia, Panama, Malta, Greek registry).
-3) Class societies (e.g. DNV, LR, ABS, BV, RINA, ClassNK, CCS, other IACS members).
-4) Port State / regional regulators (e.g. EU, USCG, AMSA, CARB, other national or regional authorities, ECSA – European Community Shipowners’ Associations, ASA – Asian Shipowners’ Association).
-5) Technical / Consulting entities like Intercargo, INTERTANKO, Helmepa, Union of Greek Shipwoners, BIMCO, NAMEPA, World Shipping Council (WSC),  etc.
-
-Use other secondary sources only if these primary sources are unclear or not available.
-
-General requirements:
-
-- For every development you report, name the issuing authority explicitly
-  (e.g. "IMO", "Marshall Islands flag", "DNV", "EU Commission", "AMSA").
-- Provide, where available, a direct URL to an official or primary source for the development
-  (IMO document page, flag circular page, class technical news item, EU act, etc.).
-- If you are not certain about very recent changes, say briefly:
-  "Check latest official sources (IMO, flag, port, class) for confirmation."
-
-Output format rules (very important):
-
-- Your response MUST obey one of the following two options:
-
-  OPTION A: No updates found in the 365-day window
-  ------------------------------------------------
-  - Reply with exactly the single token:
-    NO_UPDATES
-  - No headings, no bullets, no spaces or extra characters.
-
-  OPTION B: One or more updates found
-  -----------------------------------
-  - Reply as a plain-text bullet list.
-  - At most 8 bullets.
-  - Each bullet on its own line.
-  - Each bullet MUST follow this pattern (single line):
-
-    - Authority - Instrument - Date - short practical summary - URL
-
-    where:
-      - "Authority" is something like "IMO", "EU", "Marshall Islands flag",
-        "Panama flag", "DNV", "US EPA", "AMSA", "CARB", etc.
-      - "Instrument" is the resolution, regulation, circular, notice or law
-        (e.g. "MEPC.340(77)", "EU FuelEU Maritime delegated act", "MI-ENV-2025-01").
-      - "Date" is YYYY-MM-DD if known; otherwise use a clear text like "2025-10 (month only)"
-        or "date unclear".
-      - "short practical summary" is 1–2 lines explaining impact for ships
-        (operations, documentation, surveys, inspections).
-      - "URL" is an HTTPS URL to an official or primary source for this development.
-        If no reliable URL is available, write "link unavailable".
-
-- Do NOT use markdown formatting (no **, no __, no ``` code fences, no backticks).
-- No numbered sections, no introductions, no closing paragraphs.
-- Plain ASCII as far as possible (normal hyphens and spaces only).
-""".strip()
-
-
+# -------------------------
+# Categories / Topics
+# -------------------------
 TOPICS: Dict[str, str] = {
     "MARPOL Annex I – Oil": (
-        "Monitor and describe only recent changes, amendments, circulars or "
-        "implementation guidance relevant to MARPOL Annex I (oil pollution). "
-        "Do not repeat the full Annex structure or historical requirements; "
-        "focus strictly on what is new for ship operations in the last 365 days."
+        "Monitor only recent changes, amendments, circulars or implementation guidance relevant "
+        "to MARPOL Annex I (oil pollution). Focus strictly on what is new for ship operations."
     ),
     "MARPOL Annex II – Noxious Liquid Substances": (
-        "Monitor and describe only recent changes, amendments, circulars or "
-        "implementation guidance affecting MARPOL Annex II (NLS). Include any "
-        "new cargo categorisations, prewash requirements or key MEPC updates "
-        "that appeared in the last 365 days."
+        "Monitor only recent changes, amendments, circulars or implementation guidance affecting "
+        "MARPOL Annex II (NLS). Include any new cargo categorisations, prewash requirements or "
+        "key MEPC updates."
     ),
     "MARPOL Annex III – Harmful Substances in Packaged Form": (
-        "Monitor and describe only recent changes or cross-references between "
-        "MARPOL Annex III and the IMDG Code that affect shipboard practice. "
-        "Do not rewrite the full annex; focus strictly on new or updated requirements "
-        "within the last 365 days."
+        "Monitor only recent changes or cross-references between MARPOL Annex III and the IMDG Code "
+        "that affect shipboard practice."
     ),
     "MARPOL Annex IV – Sewage": (
-        "Monitor and describe only recent developments on MARPOL Annex IV, "
-        "including new special areas, updated discharge standards or equipment "
-        "requirements that entered into force or were agreed in the last 365 days."
+        "Monitor only recent developments on MARPOL Annex IV, including new special areas, updated "
+        "discharge standards or equipment requirements."
     ),
     "MARPOL Annex V – Garbage": (
-        "Monitor and describe only recent changes related to MARPOL Annex V, "
-        "such as updated garbage categories, record-keeping guidance, or new "
-        "PSC focus areas introduced in the last 365 days."
+        "Monitor only recent changes related to MARPOL Annex V, such as updated garbage categories, "
+        "record-keeping guidance, or new PSC focus areas."
     ),
     "MARPOL Annex VI – Air Pollution and GHG": (
-        "Monitor and describe only recent changes to MARPOL Annex VI, "
-        "including SOx/NOx guidance, fuel sulphur enforcement, EEXI/CII, Emissions Regulations "
-        "guidelines, or IMO GHG strategy developments in the last 365 days. "
-        "No general explanation of EEXI/CII; only new items. "
-        "Fuel EU, EU ETS developments."
+        "Monitor only recent changes to MARPOL Annex VI, including SOx/NOx guidance, fuel sulphur "
+        "enforcement, EEXI/CII developments, and IMO GHG strategy items. Include EU ETS / FuelEU only "
+        "when they are official/regulatory developments."
     ),
     "Ballast Water Management Convention (BWM)": (
-        "Monitor and describe only recent changes for the BWM Convention, "
-        "including D-1/D-2 implementation, new sampling/inspection practices, "
-        "or updated type-approval guidance adopted in the last 365 days."
+        "Monitor only recent changes for the BWM Convention, including D-1/D-2 implementation, "
+        "sampling/inspection practices, or updated type-approval guidance."
     ),
     "Anti-fouling Systems (AFS Convention)": (
-        "Monitor and describe only recent changes under the AFS Convention, "
-        "such as new substances controlled, updated guidelines or notable "
-        "regional responses in the last 365 days."
+        "Monitor only recent changes under the AFS Convention, such as new substances controlled, "
+        "updated guidelines or notable regional responses."
     ),
     "Regional / local regimes (EU, US, AUS, etc.)": (
-        "Monitor and describe only recent changes in major regional regimes "
-        "affecting ship environmental performance (EU MRV, FuelEU Maritime, "
-        "EU ETS for shipping, US EPA/VGP, California CARB, Australia AMSA, etc.) "
-        "and summarise new or amended instruments, circulars or enforcement "
-        "practices from the last 365 days."
+        "Monitor only recent changes in major regional regimes affecting ships (EU ETS, FuelEU, MRV, "
+        "US EPA, USCG, CARB, AMSA, etc.). Prefer regulator sources."
     ),
 }
 
+CATEGORY_TABS_ORDER = [
+    "MARPOL Annex I – Oil",
+    "MARPOL Annex II – Noxious Liquid Substances",
+    "MARPOL Annex III – Harmful Substances in Packaged Form",
+    "MARPOL Annex IV – Sewage",
+    "MARPOL Annex V – Garbage",
+    "MARPOL Annex VI – Air Pollution and GHG",
+    "Ballast Water Management Convention (BWM)",
+    "Anti-fouling Systems (AFS Convention)",
+    "Regional / local regimes (EU, US, AUS, etc.)",
+]
 
+
+# -------------------------
+# Storage (no deletions)
+# -------------------------
 DATA_DIR = os.environ.get("DATA_DIR", "data")
-LATEST_PATH = os.path.join(DATA_DIR, "latest.txt")
-HISTORY_PATH = os.path.join(DATA_DIR, "history.jsonl")
-
+STATE_PATH = os.path.join(DATA_DIR, "state.json")  # single source of truth
+LATEST_RUN_PATH = os.path.join(DATA_DIR, "latest_run.json")  # just last run additions (for highlighting)
 
 def _ensure_data_dir() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-def save_result(output: str) -> None:
+def load_state() -> dict:
     _ensure_data_dir()
-    with open(LATEST_PATH, "w", encoding="utf-8") as f:
-        f.write(output)
+    if not os.path.exists(STATE_PATH):
+        return {"items": []}
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"items": []}
 
-    rec = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "output": output,
-    }
-    with open(HISTORY_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+def save_state(state: dict) -> None:
+    _ensure_data_dir()
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=True, indent=2)
 
+def save_latest_run(additions: List[dict]) -> None:
+    _ensure_data_dir()
+    payload = {"timestamp_utc": _utc_now_iso(), "additions": additions}
+    with open(LATEST_RUN_PATH, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=True, indent=2)
 
-def load_latest() -> str:
-    if not os.path.exists(LATEST_PATH):
-        return ""
-    with open(LATEST_PATH, "r", encoding="utf-8") as f:
-        return f.read().strip()
-
-
-def load_history_tail(limit: int = 50) -> List[dict]:
-    if not os.path.exists(HISTORY_PATH):
-        return []
-    with open(HISTORY_PATH, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-
-    out: List[dict] = []
-    for line in reversed(lines[-limit:]):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            out.append(json.loads(line))
-        except Exception:
-            continue
-    return out
+def load_latest_run() -> dict:
+    _ensure_data_dir()
+    if not os.path.exists(LATEST_RUN_PATH):
+        return {"timestamp_utc": None, "additions": []}
+    try:
+        with open(LATEST_RUN_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"timestamp_utc": None, "additions": []}
 
 
+# -------------------------
+# Clients
+# -------------------------
 def _tavily_client() -> TavilyClient:
     key = os.environ.get("TAVILY_API_KEY", "").strip()
     if not key:
         raise RuntimeError("Missing TAVILY_API_KEY environment variable.")
     return TavilyClient(api_key=key)
-
 
 def _groq_client() -> OpenAI:
     key = os.environ.get("GROQ_API_KEY", "").strip()
@@ -206,31 +127,37 @@ def _groq_client() -> OpenAI:
     return OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
 
 
+# -------------------------
+# Retrieval
+# -------------------------
 def _search_topic(
     client: TavilyClient,
     topic_name: str,
-    topic_guidance: str,
     today_utc: str,
     search_depth: str,
     max_results: int,
     preferred_domains: Optional[List[str]],
+    window_days: int,
 ) -> List[dict]:
+    # Stronger, more targeted query. We bias toward official + recency.
     q = (
-        f"{topic_name} shipping regulation update OR amendment OR circular OR guidance "
-        f"site:imo.org OR MEPC OR MSC OR flag circular OR class technical news OR EU regulation "
-        f"within last 12 months {today_utc}"
+        f"{topic_name} "
+        f"(amendment OR circular OR resolution OR guideline OR enforcement OR delegated act OR regulation) "
+        f"(MEPC OR IMO OR flag circular OR class technical news OR EU Commission OR USCG OR AMSA OR CARB) "
+        f"last {window_days} days"
     )
 
     kwargs = {}
     if preferred_domains:
         kwargs["include_domains"] = preferred_domains
 
+    # include_raw_content=True provides more substance for the LLM than snippets.
     res = client.search(
         query=q,
         search_depth=search_depth,
         max_results=max_results,
         include_answer=False,
-        include_raw_content=False,
+        include_raw_content=True,
         include_images=False,
         **kwargs,
     )
@@ -238,103 +165,143 @@ def _search_topic(
     results = res.get("results", []) if isinstance(res, dict) else []
     for r in results:
         r["_topic"] = topic_name
-        r["_topic_guidance"] = topic_guidance
     return results
 
 
-def _build_context(sources: List[dict], max_chars: int = 8000) -> str:
+def _build_context(sources: List[dict], max_chars: int = 12000) -> str:
+    # Compact but richer than before: use raw_content when available.
     chunks: List[str] = []
     for s in sources:
         title = (s.get("title") or "").strip()
         url = (s.get("url") or "").strip()
+        raw = (s.get("raw_content") or "").strip()
         content = (s.get("content") or s.get("snippet") or "").strip()
         topic = (s.get("_topic") or "").strip()
+
         if not url:
             continue
-        chunks.append(f"TOPIC: {topic}\nTITLE: {title}\nURL: {url}\nSNIPPET: {content}\n")
 
-    text = "\n".join(chunks).strip()
+        body = raw if raw else content
+        if not body:
+            continue
+
+        block = f"TOPIC: {topic}\nTITLE: {title}\nURL: {url}\nCONTENT:\n{body}\n"
+        chunks.append(block)
+
+    text = "\n\n".join(chunks).strip()
     if len(text) <= max_chars:
         return text
-    return text[:max_chars] + "\n(TRUNCATED)\n"
+    return text[:max_chars] + "\n\n(TRUNCATED)\n"
 
 
-def _validate_output(out: str) -> str:
-    out = (out or "").strip()
+# -------------------------
+# LLM extraction (JSON)
+# -------------------------
+SYSTEM_PROMPT = (
+    "You are an Environmental Specialist Watch Dog for an international ship management company. "
+    "You extract only regulatory developments within a time window defined by the user. "
+    "You prefer official sources (IMO, flags, regulators, class) and ignore older baseline rules.\n\n"
+    "Return STRICT JSON only: a JSON array of objects. No markdown. No extra text.\n"
+    "Each object must have keys:\n"
+    "category, authority, instrument, date, summary, url\n"
+    "date must be 'YYYY-MM-DD' if known; else 'date unclear'.\n"
+    "summary must be short and practical (operations/docs/surveys/inspections).\n"
+    "url must be https or 'link unavailable'."
+)
 
-    if out == "NO_UPDATES":
-        return out
-
-    lines = [ln.rstrip() for ln in out.splitlines() if ln.strip()]
-    if not lines:
-        return "NO_UPDATES"
-
-    if len(lines) > 8:
-        lines = lines[:8]
-
-    for ln in lines:
-        if not ln.startswith("- "):
-            return "NO_UPDATES"
-        if ln.count(" - ") < 4:
-            return "NO_UPDATES"
-        tail = ln.split(" - ")[-1].strip()
-        if not (tail.startswith("https://") or tail == "link unavailable"):
-            return "NO_UPDATES"
-
+def _safe_json_loads(text: str) -> Optional[Any]:
+    text = (text or "").strip()
+    if not text:
+        return None
+    # Attempt direct parse
     try:
-        out_ascii = "\n".join(lines).encode("ascii", errors="ignore").decode("ascii")
+        return json.loads(text)
     except Exception:
-        out_ascii = "\n".join(lines)
+        pass
+    # Attempt to extract first JSON array from text
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except Exception:
+            return None
+    return None
 
-    return out_ascii.strip() if out_ascii.strip() else "NO_UPDATES"
+def _normalize_item(x: dict, fallback_category: str) -> Optional[dict]:
+    if not isinstance(x, dict):
+        return None
 
+    category = (x.get("category") or fallback_category).strip()
+    authority = (x.get("authority") or "").strip()
+    instrument = (x.get("instrument") or "").strip()
+    date = (x.get("date") or "date unclear").strip()
+    summary = (x.get("summary") or "").strip()
+    url = (x.get("url") or "link unavailable").strip()
 
-def run_watchdog(
+    if not category:
+        category = fallback_category
+
+    # enforce url rule
+    if not (url.startswith("https://") or url == "link unavailable"):
+        url = "link unavailable"
+
+    # require at least something meaningful
+    if not authority and not instrument and not summary and url == "link unavailable":
+        return None
+
+    return {
+        "category": category,
+        "authority": authority or "authority unclear",
+        "instrument": instrument or "instrument unclear",
+        "date": date or "date unclear",
+        "summary": summary or "summary unclear",
+        "url": url,
+    }
+
+def _item_id(item: dict) -> str:
+    # Stable ID for dedupe: authority|instrument|date|url
+    key = f"{item.get('authority','')}|{item.get('instrument','')}|{item.get('date','')}|{item.get('url','')}"
+    return hashlib.sha256(key.encode("utf-8", errors="ignore")).hexdigest()[:24]
+
+def _date_sort_key(date_str: str) -> Tuple[int, str]:
+    # Newest first. Unknown dates go last.
+    ds = (date_str or "").strip()
+    if ds.lower() == "date unclear":
+        return (0, "")
+    # Accept YYYY-MM-DD or YYYY-MM
+    try:
+        if len(ds) == 10:
+            dt = datetime.strptime(ds, "%Y-%m-%d")
+            return (1, dt.isoformat())
+        if len(ds) == 7:
+            dt = datetime.strptime(ds, "%Y-%m")
+            return (1, dt.isoformat())
+    except Exception:
+        return (0, "")
+    return (0, "")
+
+def _extract_updates_for_topic(
+    llm: OpenAI,
+    model_id: str,
+    topic_name: str,
+    topic_guidance: str,
     today_utc: str,
-    tavily_search_depth: str = "advanced",
-    max_results_per_topic: int = 5,
-    preferred_domains: Optional[List[str]] = None,
-) -> str:
-    tav = _tavily_client()
-
-    all_sources: List[dict] = []
-    for topic, guidance in TOPICS.items():
-        all_sources.extend(
-            _search_topic(
-                client=tav,
-                topic_name=topic,
-                topic_guidance=guidance,
-                today_utc=today_utc,
-                search_depth=tavily_search_depth,
-                max_results=max_results_per_topic,
-                preferred_domains=preferred_domains,
-            )
-        )
-
-    seen = set()
-    uniq: List[dict] = []
-    for s in all_sources:
-        u = (s.get("url") or "").strip()
-        if not u or u in seen:
-            continue
-        seen.add(u)
-        uniq.append(s)
-
-    context = _build_context(uniq)
-
+    window_days: int,
+    context: str,
+) -> List[dict]:
     user_prompt = (
         f"today={today_utc}\n"
-        f"Task: Identify ONLY developments within the last 365 days relative to today.\n"
-        f"Use the source priority described in SYSTEM_PROMPT.\n"
-        f"Return ONLY in the required output format.\n\n"
+        f"window_days={window_days}\n"
+        f"category={topic_name}\n"
+        f"Topic guidance: {topic_guidance}\n\n"
+        f"Extract ONLY developments within the last window_days relative to today.\n"
+        f"If nothing qualifies, return an empty JSON array: [].\n\n"
         f"SOURCES:\n{context}\n"
     )
 
-    client_llm = _groq_client()
-    model_id = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
-
     try:
-        resp = client_llm.chat.completions.create(
+        resp = llm.chat.completions.create(
             model=model_id,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -342,9 +309,122 @@ def run_watchdog(
             ],
             temperature=0.1,
         )
-        text = (resp.choices[0].message.content or "").strip()
-        return _validate_output(text)
+        raw = (resp.choices[0].message.content or "").strip()
     except Exception as e:
-        # Show real error in Cloud UI/logs, but still obey output contract:
-        st.error(f"LLM request failed: {type(e).__name__}: {e}")
-        return "NO_UPDATES"
+        st.error(f"LLM request failed for '{topic_name}': {type(e).__name__}: {e}")
+        return []
+
+    parsed = _safe_json_loads(raw)
+    if not isinstance(parsed, list):
+        return []
+
+    out: List[dict] = []
+    for obj in parsed:
+        norm = _normalize_item(obj, fallback_category=topic_name)
+        if norm:
+            out.append(norm)
+
+    # Sort by date descending (newest first)
+    out.sort(key=lambda it: _date_sort_key(it.get("date", "")), reverse=True)
+    return out
+
+
+# -------------------------
+# Main runner: merge-only (no deletions)
+# -------------------------
+def run_watchdog(
+    today_utc: str,
+    tavily_search_depth: str = "advanced",
+    max_results_per_topic: int = 8,
+    preferred_domains: Optional[List[str]] = None,
+    window_days: int = 730,
+) -> dict:
+    """
+    Returns dict:
+      {
+        "timestamp_utc": "...",
+        "added": [items...],        # new additions in this run
+        "all_items": [items...],    # full state after merge
+      }
+    """
+    tav = _tavily_client()
+    llm = _groq_client()
+    model_id = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+
+    # Load existing persistent state (never delete)
+    state = load_state()
+    existing_items: List[dict] = state.get("items", [])
+    existing_by_id = {it.get("id"): it for it in existing_items if isinstance(it, dict) and it.get("id")}
+
+    # For transparency/debug, we keep a run-level additions list
+    additions: List[dict] = []
+
+    for topic in CATEGORY_TABS_ORDER:
+        guidance = TOPICS[topic]
+
+        sources = _search_topic(
+            client=tav,
+            topic_name=topic,
+            today_utc=today_utc,
+            search_depth=tavily_search_depth,
+            max_results=max_results_per_topic,
+            preferred_domains=preferred_domains,
+            window_days=window_days,
+        )
+
+        # Deduplicate sources by URL and keep a sane cap for context
+        seen_urls = set()
+        uniq_sources = []
+        for s in sources:
+            u = (s.get("url") or "").strip()
+            if not u or u in seen_urls:
+                continue
+            seen_urls.add(u)
+            uniq_sources.append(s)
+
+        context = _build_context(uniq_sources, max_chars=12000)
+
+        extracted = _extract_updates_for_topic(
+            llm=llm,
+            model_id=model_id,
+            topic_name=topic,
+            topic_guidance=guidance,
+            today_utc=today_utc,
+            window_days=window_days,
+            context=context,
+        )
+
+        # Merge-only: add new items if not already present
+        for item in extracted:
+            item_id = _item_id(item)
+            if item_id in existing_by_id:
+                # touch last_seen (no deletion/modification of core content)
+                existing_by_id[item_id]["last_seen_utc"] = _utc_now_iso()
+                continue
+
+            new_item = dict(item)
+            new_item["id"] = item_id
+            new_item["first_seen_utc"] = _utc_now_iso()
+            new_item["last_seen_utc"] = new_item["first_seen_utc"]
+
+            # Insert new items at the beginning (newest additions on top)
+            existing_items.insert(0, new_item)
+            existing_by_id[item_id] = new_item
+            additions.append(new_item)
+
+    # Global sort in storage: newest date first, unknown last.
+    # Note: stable (inserted additions already on top), but we also sort for long-term sanity.
+    existing_items.sort(
+        key=lambda it: _date_sort_key((it or {}).get("date", "")),
+        reverse=True,
+    )
+
+    state["items"] = existing_items
+    save_state(state)
+    save_latest_run(additions)
+
+    return {
+        "timestamp_utc": _utc_now_iso(),
+        "added": additions,
+        "all_items": existing_items,
+    }
