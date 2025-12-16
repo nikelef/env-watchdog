@@ -114,7 +114,7 @@ def load_state() -> dict:
             state["items"] = []
             return state
 
-        # Light cleanup on load (id-based) to prevent runaway duplication.
+        # Light cleanup on load (id-based)
         deduped = _dedupe_items_keep_first_by_id(items)
         if len(deduped) != len(items):
             state["items"] = deduped
@@ -277,6 +277,15 @@ def _normalize_item(x: dict, fallback_category: str) -> Optional[dict]:
     if authority == "authority unclear" and instrument == "instrument unclear" and summary == "summary unclear" and url == "link unavailable":
         return None
 
+    # Ensure exactly 2 lines for the UI column
+    summary_lines = [ln.strip() for ln in summary.splitlines() if ln.strip()]
+    if len(summary_lines) >= 2:
+        summary = summary_lines[0] + "\n" + summary_lines[1]
+    elif len(summary_lines) == 1:
+        summary = summary_lines[0] + "\n" + "Action: Review/implement and update documentation as applicable."
+    else:
+        summary = "summary unclear\nAction: Review/implement and update documentation as applicable."
+
     return {
         "category": category,
         "authority": authority,
@@ -356,7 +365,7 @@ def _extract_updates_for_topic(
 
 
 # -------------------------
-# Canonical dedupe (URL-first)
+# Canonical dedupe (URL+instrument first)
 # -------------------------
 def _canon_text(x: str) -> str:
     x = (x or "").strip().lower()
@@ -374,11 +383,6 @@ def _canon_url(url: str) -> str:
 
 
 def _dedupe_key(item: dict) -> str:
-    """
-    SAFE variant:
-    - Prefer URL + instrument (so one page that mentions multiple instruments does not collapse everything).
-    - Fallback: authority|instrument|date
-    """
     url = _canon_url(item.get("url", ""))
     instrument = _canon_text(item.get("instrument", ""))
     if url:
@@ -389,7 +393,6 @@ def _dedupe_key(item: dict) -> str:
 
 
 def _dedupe_items_canonical(items: List[dict]) -> List[dict]:
-    """Remove duplicates using _dedupe_key(). Keeps first occurrence (newest/top)."""
     out: List[dict] = []
     seen = set()
     for it in items:
@@ -407,7 +410,31 @@ def _dedupe_items_canonical(items: List[dict]) -> List[dict]:
 
 
 # -------------------------
-# Main runner: merge-only + FINAL dedupe pass
+# 60-day alert flag
+# -------------------------
+def _is_within_days(date_str: str, today_utc: str, days: int) -> bool:
+    try:
+        today = datetime.strptime(today_utc, "%Y-%m-%d")
+    except Exception:
+        return False
+
+    ds = (date_str or "").strip()
+    try:
+        if len(ds) == 10:
+            dt = datetime.strptime(ds, "%Y-%m-%d")
+        elif len(ds) == 7:
+            dt = datetime.strptime(ds, "%Y-%m")
+        else:
+            return False
+    except Exception:
+        return False
+
+    delta = (today - dt).days
+    return 0 <= delta <= days
+
+
+# -------------------------
+# Main runner
 # -------------------------
 def run_watchdog(
     today_utc: str,
@@ -427,7 +454,6 @@ def run_watchdog(
     if not isinstance(existing_items, list):
         existing_items = []
 
-    # Ensure id-based uniqueness before merge
     existing_items = _dedupe_items_keep_first_by_id(existing_items)
     existing_by_id = {it.get("id"): it for it in existing_items if isinstance(it, dict) and it.get("id")}
 
@@ -455,7 +481,6 @@ def run_watchdog(
             window_days=window_days,
         )
 
-        # Deduplicate sources by URL for context
         seen_urls = set()
         uniq_sources = []
         for s in sources:
@@ -487,16 +512,15 @@ def run_watchdog(
             new_item["id"] = item_id
             new_item["first_seen_utc"] = _utc_now_iso()
             new_item["last_seen_utc"] = new_item["first_seen_utc"]
+            new_item["alert_60d"] = _is_within_days(new_item.get("date", ""), today_utc, 60)
 
             existing_items.insert(0, new_item)
             existing_by_id[item_id] = new_item
             additions.append(new_item)
 
-    # Sort newest-first by date (unknown last)
+    # Sort newest-first and dedupe
     existing_items = _dedupe_items_keep_first_by_id(existing_items)
     existing_items.sort(key=lambda it: _date_sort_key((it or {}).get("date", "")), reverse=True)
-
-    # FINAL canonical dedupe to remove "same finding" variants
     existing_items = _dedupe_items_canonical(existing_items)
 
     state["items"] = existing_items
