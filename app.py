@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timezone
 from typing import List
+
 import pandas as pd
 import streamlit as st
 from openai import OpenAI
@@ -17,15 +18,16 @@ ALERT_RECIPIENT = "neleftheriou@tms-dry.com"
 
 st.set_page_config(page_title="Environmental Watch Dog", layout="wide")
 st.title("Environmental Watch Dog")
-st.caption("Per-category, collapsible, newest first, merge-only (no deletions).")
+st.caption("Multi-pass search + source rerank + full-text fetch (cached). Collapsible categories. Flag rows to draft emails.")
 
 
-# ---- CSS: wrap text inside Streamlit dataframe/editor cells ----
+# ---- CSS: wrap text inside Streamlit data_editor/dataframe cells ----
 st.markdown(
     """
     <style>
-    /* Force wrapping in dataframe/data_editor cells */
-    div[data-testid="stDataFrame"] div[role="gridcell"] {
+    /* Wrap in dataframe/editor cells */
+    div[data-testid="stDataFrame"] div[role="gridcell"],
+    div[data-testid="stDataEditor"] div[role="gridcell"] {
         white-space: normal !important;
         line-height: 1.25 !important;
         word-break: break-word !important;
@@ -59,10 +61,6 @@ def _groq_client() -> OpenAI:
 
 
 def _email_paragraph_200w(item: dict) -> str:
-    """
-    Generate ~200-word single-paragraph email summary for one item.
-    Uses Groq model configured in secrets/env.
-    """
     model_id = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
     llm = _groq_client()
 
@@ -75,8 +73,9 @@ def _email_paragraph_200w(item: dict) -> str:
     prompt = (
         "Write ONE paragraph (no bullets) of about 180-220 words suitable for an internal company email. "
         "Summarize the regulatory development below in practical shipping terms. "
-        "Focus on: what changed, effective/enforcement timing if known, operational impact, documentation/survey/PSC focus. "
-        "Do not invent facts. If uncertain, state that confirmation from official sources is needed.\n\n"
+        "Focus on: what changed, effective/enforcement timing if known, operational impact, "
+        "documentation/survey/PSC focus. Do not invent facts. If uncertain, state that confirmation "
+        "from official sources is needed.\n\n"
         f"Authority: {authority}\n"
         f"Instrument: {instrument}\n"
         f"Date: {date}\n"
@@ -93,9 +92,7 @@ def _email_paragraph_200w(item: dict) -> str:
         temperature=0.2,
     )
     out = (resp.choices[0].message.content or "").strip()
-
-    # Ensure it stays one paragraph
-    out = " ".join(out.splitlines()).strip()
+    out = " ".join(out.splitlines()).strip()  # enforce one paragraph
     return out
 
 
@@ -138,53 +135,37 @@ def _category_df(cat_items: list, latest_added_ids: set[str]) -> pd.DataFrame:
             url = "link unavailable"
         url = url if url.startswith("https://") else "link unavailable"
 
-        # "Latest" marker (per category)
-        latest_marker = "LATEST" if idx == 0 else ""
-
         rows.append(
             {
                 "Flag": False,
-                "Latest": latest_marker,
+                "Latest": "LATEST" if idx == 0 else "",
                 "NEW": "YES" if _id in latest_added_ids else "",
                 "Date": it.get("date", "date unclear"),
                 "Authority": it.get("authority", ""),
                 "Instrument": it.get("instrument", ""),
                 "Practical summary": it.get("summary", ""),
                 "URL": url,
-                "_id": _id,  # hidden later (for mapping back)
+                "_id": _id,  # internal mapping
             }
         )
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
 
 with st.sidebar:
     st.header("Settings")
 
     today_override = st.text_input("Today override (YYYY-MM-DD, optional)", value=os.environ.get("TODAY_OVERRIDE", ""))
-    window_days = st.number_input(
-        "Lookback window (days)",
-        min_value=30,
-        max_value=3650,
-        value=int(os.environ.get("WINDOW_DAYS", "730")),
-    )
-
+    window_days = st.number_input("Lookback window (days)", min_value=30, max_value=3650, value=int(os.environ.get("WINDOW_DAYS", "730")))
     search_depth = st.selectbox("Tavily search depth", ["basic", "advanced"], index=1)
 
-    max_results_per_topic = st.number_input(
-        "Tavily results per topic (all categories except Local/Regional)",
-        min_value=3,
-        max_value=15,
-        value=int(os.environ.get("MAX_RESULTS_PER_TOPIC", "8")),
-    )
+    max_results_per_topic = st.number_input("Search results per topic (non-Local)", min_value=5, max_value=40, value=int(os.environ.get("MAX_RESULTS_PER_TOPIC", "12")))
+    local_results_per_topic = st.number_input("Search results per topic (Local only)", min_value=10, max_value=80, value=int(os.environ.get("LOCAL_RESULTS_PER_TOPIC", "30")))
 
-    local_results_per_topic = st.number_input(
-        "Tavily results per topic (Local/Regional only)",
-        min_value=5,
-        max_value=40,
-        value=int(os.environ.get("LOCAL_RESULTS_PER_TOPIC", "20")),
-        help=f"Applies only to: {LOCAL_CATEGORY}",
-    )
+    rerank_top_k = st.number_input("Rerank: candidate sources kept (per topic)", min_value=5, max_value=30, value=int(os.environ.get("RERANK_TOP_K", "10")))
+    fetch_fulltext_top_k = st.number_input("Fetch full-text for top N sources (per topic)", min_value=0, max_value=20, value=int(os.environ.get("FETCH_FULLTEXT_TOP_K", "6")))
+    fetch_timeout_sec = st.number_input("Fetch timeout per URL (sec)", min_value=5, max_value=60, value=int(os.environ.get("FETCH_TIMEOUT_SEC", "20")))
+    fetch_cache_ttl_hours = st.number_input("Fetch cache TTL (hours)", min_value=1, max_value=720, value=int(os.environ.get("FETCH_CACHE_TTL_HOURS", "72")))
+    polite_delay_sec = st.number_input("Polite delay between fetches (sec)", min_value=0.0, max_value=3.0, value=float(os.environ.get("POLITE_DELAY_SEC", "0.4")))
 
     include_domains = st.text_area(
         "Preferred domains (optional, comma-separated)",
@@ -205,12 +186,19 @@ if auto_refresh:
 
 run_now = st.button("Run now", type="primary")
 
-# Progress indicator
 status_box = st.status("Idle", expanded=False)
 progress_bar = st.progress(0)
 
-def _progress_cb(topic: str, idx: int, total: int) -> None:
-    status_box.update(label=f"Running: {idx}/{total} — {topic}", state="running", expanded=False)
+PHASE_LABELS = {
+    "search": "Searching",
+    "rerank": "Reranking sources",
+    "fetch": "Fetching full text",
+    "extract": "Extracting updates",
+}
+
+def _progress_cb(topic: str, idx: int, total: int, phase: str) -> None:
+    phase_txt = PHASE_LABELS.get(phase, phase)
+    status_box.update(label=f"{phase_txt}: {idx}/{total} — {topic}", state="running", expanded=False)
     pct = int((idx / max(total, 1)) * 100)
     progress_bar.progress(pct)
 
@@ -227,6 +215,11 @@ if run_now or auto_refresh:
         local_results_per_topic=int(local_results_per_topic),
         preferred_domains=_parse_domains(include_domains),
         window_days=int(window_days),
+        rerank_top_k=int(rerank_top_k),
+        fetch_fulltext_top_k=int(fetch_fulltext_top_k),
+        fetch_timeout_sec=int(fetch_timeout_sec),
+        fetch_cache_ttl_hours=int(fetch_cache_ttl_hours),
+        polite_delay_sec=float(polite_delay_sec),
         progress_callback=_progress_cb,
     )
 
@@ -247,16 +240,13 @@ if not items:
     st.info("No stored items yet. Click 'Run now'.")
     st.stop()
 
-# ---- Flagging workflow ----
 st.subheader("Flag items and generate email drafts")
-
 gen_drafts = st.button("Generate email draft(s) for flagged", type="secondary")
 
-# Store flagged drafts output in session_state so it persists after rerun
 if "drafts" not in st.session_state:
     st.session_state["drafts"] = []
 
-st.caption("Flag any entry (checkbox). Then click the button to generate an email-ready 1-paragraph (~200 words) summary.")
+st.caption("Tick Flag next to any entry, then generate email drafts (1 paragraph, ~200 words).")
 
 flagged_requests: List[dict] = []
 
@@ -271,16 +261,9 @@ for cat in CATEGORY_TABS_ORDER:
             st.info("No items stored for this category.")
             continue
 
-        # Light-blue highlight for latest row (row 0) via Styler
-        def _style_latest(row_idx: int):
-            if row_idx == 0:
-                return ["background-color: #d9ecff"] * len(df.columns)
-            return [""] * len(df.columns)
-
-        styled = df.style.apply(lambda _row: _style_latest(_row.name), axis=1)
-
+        # NOTE: st.data_editor does not support pandas Styler reliably. We show a "Latest" marker + CSS wrap.
         edited = st.data_editor(
-            styled,
+            df.drop(columns=[], errors="ignore"),
             hide_index=True,
             use_container_width=True,
             key=f"editor_{cat}",
@@ -298,8 +281,6 @@ for cat in CATEGORY_TABS_ORDER:
             },
         )
 
-        # Collect flagged rows for later processing
-        # Note: edited comes back as a dataframe-like object
         try:
             edited_df = pd.DataFrame(edited)
         except Exception:
@@ -310,12 +291,11 @@ for cat in CATEGORY_TABS_ORDER:
             for fid in flagged_ids:
                 flagged_requests.append({"category": cat, "id": fid})
 
-# Generate drafts on demand
+# Generate drafts
 if gen_drafts:
-    # Build lookup from state items by id
     by_id = {it.get("id"): it for it in items if isinstance(it, dict) and it.get("id")}
-
     drafts_out = []
+
     for req in flagged_requests:
         it = by_id.get(req["id"])
         if not it:
@@ -326,7 +306,7 @@ if gen_drafts:
         except Exception as e:
             paragraph = f"Could not generate summary due to error: {type(e).__name__}: {e}"
 
-        subj, draft = build_email_draft(ALERT_RECIPIENT, it, paragraph, today_utc)
+        _, draft = build_email_draft(ALERT_RECIPIENT, it, paragraph, today_utc)
         drafts_out.append(
             {
                 "category": it.get("category", ""),
@@ -340,7 +320,7 @@ if gen_drafts:
 
     st.session_state["drafts"] = drafts_out
 
-# Show drafts (persistent)
+# Show drafts
 if st.session_state.get("drafts"):
     st.markdown("### Email draft(s) (copy/paste)")
     for i, d in enumerate(st.session_state["drafts"], start=1):
@@ -349,6 +329,6 @@ if st.session_state.get("drafts"):
         st.text_area(
             label="",
             value=d.get("draft", ""),
-            height=260,
+            height=280,
             key=f"draft_{i}",
         )
