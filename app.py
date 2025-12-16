@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 import streamlit as st
+from openai import OpenAI
 
 from env_watchdog import (
     run_watchdog,
@@ -16,7 +17,23 @@ ALERT_RECIPIENT = "neleftheriou@tms-dry.com"
 
 st.set_page_config(page_title="Environmental Watch Dog", layout="wide")
 st.title("Environmental Watch Dog")
-st.caption("2-year window, per-category, collapsible, newest first, merge-only (no deletions).")
+st.caption("Per-category, collapsible, newest first, merge-only (no deletions).")
+
+
+# ---- CSS: wrap text inside Streamlit dataframe/editor cells ----
+st.markdown(
+    """
+    <style>
+    /* Force wrapping in dataframe/data_editor cells */
+    div[data-testid="stDataFrame"] div[role="gridcell"] {
+        white-space: normal !important;
+        line-height: 1.25 !important;
+        word-break: break-word !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 def _parse_domains(raw: str):
@@ -34,36 +51,76 @@ def _today_utc_iso(today_override: str) -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
-def build_email_draft(alert_items: list, recipient: str, today_utc: str) -> tuple[str, str]:
-    subject = f"Environmental regulatory update(s) - last 60 days - {today_utc}"
-    lines = []
-    lines.append(f"To: {recipient}")
-    lines.append(f"Subject: {subject}")
-    lines.append("")
-    lines.append("Dear all,")
-    lines.append("")
-    lines.append("Please find below the recent regulatory development(s) identified within the last 60 days:")
-    lines.append("")
-    for it in alert_items[:10]:
-        summary = (it.get("summary") or "").replace("\n", " ").strip()
-        url = it.get("url") or "link unavailable"
-        authority = it.get("authority") or "authority unclear"
-        instrument = it.get("instrument") or "instrument unclear"
-        date = it.get("date") or "date unclear"
-        lines.append(f"- {authority} / {instrument} / {date}: {summary} Link: {url}")
-    lines.append("")
-    lines.append("Best regards,")
-    lines.append("Villager")
-    body = "\n".join(lines)
+def _groq_client() -> OpenAI:
+    key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("Missing GROQ_API_KEY environment variable.")
+    return OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
+
+
+def _email_paragraph_200w(item: dict) -> str:
+    """
+    Generate ~200-word single-paragraph email summary for one item.
+    Uses Groq model configured in secrets/env.
+    """
+    model_id = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+    llm = _groq_client()
+
+    authority = item.get("authority", "authority unclear")
+    instrument = item.get("instrument", "instrument unclear")
+    date = item.get("date", "date unclear")
+    url = item.get("url", "link unavailable")
+    short_summary = (item.get("summary") or "").replace("\n", " ").strip()
+
+    prompt = (
+        "Write ONE paragraph (no bullets) of about 180-220 words suitable for an internal company email. "
+        "Summarize the regulatory development below in practical shipping terms. "
+        "Focus on: what changed, effective/enforcement timing if known, operational impact, documentation/survey/PSC focus. "
+        "Do not invent facts. If uncertain, state that confirmation from official sources is needed.\n\n"
+        f"Authority: {authority}\n"
+        f"Instrument: {instrument}\n"
+        f"Date: {date}\n"
+        f"Known short summary: {short_summary}\n"
+        f"Link: {url}\n"
+    )
+
+    resp = llm.chat.completions.create(
+        model=model_id,
+        messages=[
+            {"role": "system", "content": "You write concise, factual regulatory email summaries."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+    out = (resp.choices[0].message.content or "").strip()
+
+    # Ensure it stays one paragraph
+    out = " ".join(out.splitlines()).strip()
+    return out
+
+
+def build_email_draft(recipient: str, item: dict, paragraph: str, today_utc: str) -> tuple[str, str]:
+    subject = f"Environmental regulatory update - {item.get('authority','')} {item.get('instrument','')} - {today_utc}".strip()
+    url = item.get("url") or "link unavailable"
+    date = item.get("date") or "date unclear"
+    authority = item.get("authority") or "authority unclear"
+    instrument = item.get("instrument") or "instrument unclear"
+
+    body = (
+        f"To: {recipient}\n"
+        f"Subject: {subject}\n\n"
+        f"Dear all,\n\n"
+        f"{paragraph}\n\n"
+        f"Reference: {authority} - {instrument} - {date}\n"
+        f"Link: {url}\n\n"
+        f"Best regards,\n"
+        f"Villager"
+    )
     return subject, body
 
 
-def _render_category_df(cat_items: list, latest_added_ids: set[str]) -> None:
-    if not cat_items:
-        st.info("No items stored for this category.")
-        return
-
-    # Defensive dedupe by id in display
+def _category_df(cat_items: list, latest_added_ids: set[str]) -> pd.DataFrame:
+    # Defensive dedupe by id for display
     seen = set()
     deduped = []
     for it in cat_items:
@@ -74,48 +131,31 @@ def _render_category_df(cat_items: list, latest_added_ids: set[str]) -> None:
         deduped.append(it)
 
     rows = []
-    for it in deduped:
+    for idx, it in enumerate(deduped):
         _id = it.get("id", "")
         url = it.get("url", "link unavailable")
         if not isinstance(url, str):
             url = "link unavailable"
+        url = url if url.startswith("https://") else "link unavailable"
+
+        # "Latest" marker (per category)
+        latest_marker = "LATEST" if idx == 0 else ""
 
         rows.append(
             {
+                "Flag": False,
+                "Latest": latest_marker,
                 "NEW": "YES" if _id in latest_added_ids else "",
                 "Date": it.get("date", "date unclear"),
                 "Authority": it.get("authority", ""),
                 "Instrument": it.get("instrument", ""),
                 "Practical summary": it.get("summary", ""),
-                "URL": url if url.startswith("https://") else "link unavailable",
-                "First seen (UTC)": it.get("first_seen_utc", ""),
+                "URL": url,
+                "_id": _id,  # hidden later (for mapping back)
             }
         )
-
     df = pd.DataFrame(rows)
-
-    # Highlight the latest row (row 0) light blue
-    def _style_latest(row_idx: int):
-        if row_idx == 0:
-            return ["background-color: #d9ecff"] * len(df.columns)
-        return [""] * len(df.columns)
-
-    styled = df.style.apply(lambda _row: _style_latest(_row.name), axis=1)
-
-    st.dataframe(
-        styled,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "URL": st.column_config.LinkColumn(
-                "URL",
-                help="Click to open",
-                validate="^https://.*|link unavailable$",
-                display_text="Open link",
-            ),
-        },
-    )
-    st.caption("Top row (light blue) is the latest entry in this category. NEW=YES indicates added in the latest run.")
+    return df
 
 
 with st.sidebar:
@@ -207,16 +247,108 @@ if not items:
     st.info("No stored items yet. Click 'Run now'.")
     st.stop()
 
-# Email draft block (within 60 days)
-alert_items = [it for it in items if isinstance(it, dict) and it.get("alert_60d") is True]
-if alert_items:
-    st.warning(f"ALERT: {len(alert_items)} item(s) dated within the last 60 days.")
-    subj, draft = build_email_draft(alert_items, ALERT_RECIPIENT, today_utc)
-    st.text_area("Email draft (copy/paste)", value=draft, height=260)
+# ---- Flagging workflow ----
+st.subheader("Flag items and generate email drafts")
+
+gen_drafts = st.button("Generate email draft(s) for flagged", type="secondary")
+
+# Store flagged drafts output in session_state so it persists after rerun
+if "drafts" not in st.session_state:
+    st.session_state["drafts"] = []
+
+st.caption("Flag any entry (checkbox). Then click the button to generate an email-ready 1-paragraph (~200 words) summary.")
+
+flagged_requests: List[dict] = []
 
 st.subheader("Results (click category to expand/collapse)")
 
 for cat in CATEGORY_TABS_ORDER:
     cat_items = [it for it in items if isinstance(it, dict) and it.get("category") == cat]
-    with st.expander(f"{cat} ({len(cat_items)})", expanded=False):
-        _render_category_df(cat_items, latest_added_ids)
+    df = _category_df(cat_items, latest_added_ids)
+
+    with st.expander(f"{cat} ({len(df)})", expanded=False):
+        if df.empty:
+            st.info("No items stored for this category.")
+            continue
+
+        # Light-blue highlight for latest row (row 0) via Styler
+        def _style_latest(row_idx: int):
+            if row_idx == 0:
+                return ["background-color: #d9ecff"] * len(df.columns)
+            return [""] * len(df.columns)
+
+        styled = df.style.apply(lambda _row: _style_latest(_row.name), axis=1)
+
+        edited = st.data_editor(
+            styled,
+            hide_index=True,
+            use_container_width=True,
+            key=f"editor_{cat}",
+            disabled=["Latest", "NEW", "Date", "Authority", "Instrument", "Practical summary", "URL", "_id"],
+            column_config={
+                "Flag": st.column_config.CheckboxColumn("Flag", help="Flag to generate email draft"),
+                "Latest": st.column_config.TextColumn("Latest", width="small"),
+                "NEW": st.column_config.TextColumn("NEW", width="small"),
+                "Date": st.column_config.TextColumn("Date", width="small"),
+                "Authority": st.column_config.TextColumn("Authority", width="medium"),
+                "Instrument": st.column_config.TextColumn("Instrument", width="medium"),
+                "Practical summary": st.column_config.TextColumn("Practical summary", width="large"),
+                "URL": st.column_config.LinkColumn("URL", display_text="Open link"),
+                "_id": st.column_config.TextColumn("_id", width="small"),
+            },
+        )
+
+        # Collect flagged rows for later processing
+        # Note: edited comes back as a dataframe-like object
+        try:
+            edited_df = pd.DataFrame(edited)
+        except Exception:
+            edited_df = df.copy()
+
+        if "Flag" in edited_df.columns and "_id" in edited_df.columns:
+            flagged_ids = edited_df.loc[edited_df["Flag"] == True, "_id"].tolist()
+            for fid in flagged_ids:
+                flagged_requests.append({"category": cat, "id": fid})
+
+# Generate drafts on demand
+if gen_drafts:
+    # Build lookup from state items by id
+    by_id = {it.get("id"): it for it in items if isinstance(it, dict) and it.get("id")}
+
+    drafts_out = []
+    for req in flagged_requests:
+        it = by_id.get(req["id"])
+        if not it:
+            continue
+
+        try:
+            paragraph = _email_paragraph_200w(it)
+        except Exception as e:
+            paragraph = f"Could not generate summary due to error: {type(e).__name__}: {e}"
+
+        subj, draft = build_email_draft(ALERT_RECIPIENT, it, paragraph, today_utc)
+        drafts_out.append(
+            {
+                "category": it.get("category", ""),
+                "authority": it.get("authority", ""),
+                "instrument": it.get("instrument", ""),
+                "date": it.get("date", ""),
+                "url": it.get("url", ""),
+                "draft": draft,
+            }
+        )
+
+    st.session_state["drafts"] = drafts_out
+
+# Show drafts (persistent)
+if st.session_state.get("drafts"):
+    st.markdown("### Email draft(s) (copy/paste)")
+    for i, d in enumerate(st.session_state["drafts"], start=1):
+        title = f"{i}) {d.get('category','')} - {d.get('authority','')} - {d.get('instrument','')} - {d.get('date','')}"
+        st.markdown(f"**{title}**")
+        st.text_area(
+            label="",
+            value=d.get("draft", ""),
+            height=260,
+            key=f"draft_{i}",
+        )
