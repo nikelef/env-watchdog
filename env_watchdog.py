@@ -199,22 +199,70 @@ def _search_topic(
         f"(IMO OR MEPC OR flag circular OR port state OR regulator OR class technical news) "
         f"last {window_days} days"
     )
+
     kwargs = {}
     if preferred_domains:
-        kwargs["include_domains"] = preferred_domains
+        # Ensure Tavily gets domains, not URLs
+        clean = []
+        for d in preferred_domains:
+            d = (d or "").strip()
+            if not d:
+                continue
+            d = d.replace("https://", "").replace("http://", "").strip("/")
+            if d:
+                clean.append(d)
+        if clean:
+            kwargs["include_domains"] = clean
 
-    res = client.search(
-        query=q,
-        search_depth=search_depth,
-        max_results=max_results,
-        include_answer=False,
-        include_images=False,
-        **kwargs,
-    )
+    try:
+        res = client.search(
+            query=q,
+            search_depth=search_depth,
+            max_results=max_results,
+            include_answer=False,
+            include_images=False,
+            **kwargs,
+        )
+
+    except requests.exceptions.HTTPError as e:
+        # Log status code and body (small) to Streamlit Cloud logs
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        text = getattr(getattr(e, "response", None), "text", "")
+        print(
+            "TAVILY_HTTPERROR:",
+            json.dumps(
+                {
+                    "topic": topic_name,
+                    "status_code": status,
+                    "response_text_head": (text or "")[:500],
+                    "kwargs": kwargs,
+                },
+                ensure_ascii=True,
+            ),
+        )
+        return []
+
+    except Exception as e:
+        print(
+            "TAVILY_SEARCH_ERROR:",
+            json.dumps(
+                {
+                    "topic": topic_name,
+                    "error_type": type(e).__name__,
+                    "error": str(e)[:300],
+                    "kwargs": kwargs,
+                },
+                ensure_ascii=True,
+            ),
+        )
+        return []
+
     results = res.get("results", []) if isinstance(res, dict) else []
     for r in results:
         r["_topic"] = topic_name
     return results
+
+
 
 
 def _strip_html(html: str) -> str:
