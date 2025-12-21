@@ -1,3 +1,6 @@
+# env_watchdog.py
+from __future__ import annotations
+
 import os
 import json
 import hashlib
@@ -68,6 +71,25 @@ CATEGORY_TABS_ORDER = [
 ]
 
 LOCAL_CATEGORY = "Regional / local regimes (EU, US, AUS, etc.)"
+
+# -------------------------
+# User-provided seed URLs (always read)
+# - These will be fetched and included even if Tavily fails.
+# - By default they are injected ONLY into LOCAL_CATEGORY.
+# -------------------------
+DEFAULT_EXTRA_URLS: List[str] = [
+    "https://www.amsa.gov.au/about/regulations-and-standards/index-marine-notices",
+    "https://ww2.eagle.org/en/rules-and-resources/regulatory-updates/regulatory-news.html",
+    "https://www.dnv.com/maritime/technical-regulatory-news/",
+    "https://www.classnk.or.jp/hp/en/tech_news.aspx",
+    "https://www.ccs.org.cn/ccswzen/special?columnid=202206080248772574&id=0",
+    "https://www.ccs.org.cn/ccswzen/columnList?columnid=202007171176731956",
+    "https://www.ccs.org.cn/ccswzen/circularNotice?columnid=201900002000000071",
+    "https://www.krs.co.kr/eng/",
+    "https://decarbonization.krs.co.kr/eng/",
+    "https://decarbonization.krs.co.kr/eng/Exclusive/Tech_ETC.aspx?MRID=973&URID=0",
+    "https://www.bureauveritas.gr/newsroom",
+]
 
 
 # -------------------------
@@ -183,6 +205,63 @@ def _groq_client() -> OpenAI:
 
 
 # -------------------------
+# Extra URL feeding (simple)
+# -------------------------
+def _parse_urls_text(raw: str) -> List[str]:
+    """
+    Parse newline- or comma-separated URLs from UI/env.
+    Keeps https:// only, dedupes.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    parts: List[str] = []
+    for line in raw.splitlines():
+        parts.extend([p.strip() for p in line.split(",") if p.strip()])
+    out: List[str] = []
+    seen = set()
+    for u in parts:
+        if not u.startswith("https://"):
+            continue
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
+
+
+def _sources_from_urls(urls: List[str], topic: str, score: float = 999.0) -> List[dict]:
+    out: List[dict] = []
+    for u in (urls or []):
+        u = (u or "").strip()
+        if not u.startswith("https://"):
+            continue
+        out.append(
+            {
+                "title": "User-provided URL",
+                "url": u,
+                "content": "",
+                "score": score,
+                "_topic": topic,
+                "_seed": True,
+            }
+        )
+    return out
+
+
+def _dedupe_sources_by_url(sources: List[dict]) -> List[dict]:
+    seen = set()
+    out: List[dict] = []
+    for s in sources:
+        u = (s.get("url") or "").strip()
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        out.append(s)
+    return out
+
+
+# -------------------------
 # Retrieval: search + fetch full page text
 # -------------------------
 def _search_topic(
@@ -225,7 +304,6 @@ def _search_topic(
         )
 
     except requests.exceptions.HTTPError as e:
-        # Log status code and body (small) to Streamlit Cloud logs
         status = getattr(getattr(e, "response", None), "status_code", None)
         text = getattr(getattr(e, "response", None), "text", "")
         print(
@@ -263,15 +341,10 @@ def _search_topic(
     return results
 
 
-
-
 def _strip_html(html: str) -> str:
-    # Remove script/style
     html = re.sub(r"(?is)<script.*?>.*?</script>", " ", html)
     html = re.sub(r"(?is)<style.*?>.*?</style>", " ", html)
-    # Remove tags
     text = re.sub(r"(?s)<[^>]+>", " ", html)
-    # Normalize whitespace
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -301,13 +374,10 @@ def _fetch_url_text(
             except Exception:
                 pass
 
-    # polite delay to reduce rate-limiting / blocks
     if polite_delay_sec > 0:
         time.sleep(polite_delay_sec)
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; EnvWatchdog/1.0; +https://example.invalid)"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; EnvWatchdog/1.0; +https://example.invalid)"}
     try:
         r = requests.get(url, headers=headers, timeout=timeout_sec)
         if r.status_code >= 400:
@@ -315,7 +385,7 @@ def _fetch_url_text(
         content_type = (r.headers.get("content-type") or "").lower()
 
         if "pdf" in content_type or url.lower().endswith(".pdf"):
-            # No PDF parsing here (avoids heavy deps). Keep snippet only.
+            # No PDF parsing here (avoids heavy deps).
             return ""
 
         html = r.text or ""
@@ -347,7 +417,6 @@ def _build_context_from_sources(
             continue
 
         body = fulltexts.get(url) or ""
-        # Fallback to snippet if no full text
         if not body:
             body = snippet
 
@@ -385,7 +454,7 @@ def _safe_json_loads(text: str) -> Optional[Any]:
     end = text.rfind("]")
     if start != -1 and end != -1 and end > start:
         try:
-            return json.loads(text[start:end + 1])
+            return json.loads(text[start : end + 1])
         except Exception:
             return None
     return None
@@ -399,14 +468,9 @@ def _rerank_sources(
     sources: List[dict],
     k: int,
 ) -> List[dict]:
-    """
-    Two-pass improvement: use LLM to pick top K URLs likely to be primary + recent.
-    Falls back to Tavily score ordering if LLM fails.
-    """
     if not sources:
         return []
 
-    # Build compact list
     mini = []
     for s in sources[:50]:
         mini.append(
@@ -441,7 +505,6 @@ def _rerank_sources(
             wanted = [u for u in arr if isinstance(u, str) and u.startswith("http")]
             wanted_set = set(wanted)
             out = [s for s in sources if (s.get("url") or "") in wanted_set]
-            # Keep order of wanted list
             out_sorted = []
             by_url = {s.get("url"): s for s in out}
             for u in wanted:
@@ -451,7 +514,6 @@ def _rerank_sources(
     except Exception:
         pass
 
-    # fallback: highest score first if present
     def _score(s):
         v = s.get("score")
         try:
@@ -491,7 +553,6 @@ def _normalize_item(x: dict, fallback_category: str) -> Optional[dict]:
     if not (url.startswith("https://") or url == "link unavailable"):
         url = "link unavailable"
 
-    # enforce exactly 2 lines
     summary_lines = [ln.strip() for ln in summary.splitlines() if ln.strip()]
     if len(summary_lines) >= 2:
         summary = summary_lines[0] + "\n" + summary_lines[1]
@@ -500,7 +561,12 @@ def _normalize_item(x: dict, fallback_category: str) -> Optional[dict]:
     else:
         summary = "summary unclear\nAction: Review/implement and update documentation as applicable."
 
-    if authority == "authority unclear" and instrument == "instrument unclear" and summary.startswith("summary unclear") and url == "link unavailable":
+    if (
+        authority == "authority unclear"
+        and instrument == "instrument unclear"
+        and summary.startswith("summary unclear")
+        and url == "link unavailable"
+    ):
         return None
 
     return {
@@ -644,6 +710,8 @@ def run_watchdog(
     context_max_total_chars: int = 45000,
     polite_delay_sec: float = 0.4,
     progress_callback=None,
+    # NEW: feed specific URLs (read regardless of Tavily)
+    extra_urls: Optional[List[str]] = None,
 ) -> dict:
     tav = _tavily_client()
     llm = _groq_client()
@@ -661,6 +729,9 @@ def run_watchdog(
 
     additions: List[dict] = []
     total = len(CATEGORY_TABS_ORDER)
+
+    # If UI passes nothing, fall back to your fixed list
+    effective_extra_urls = (extra_urls or []) or list(DEFAULT_EXTRA_URLS)
 
     for i, topic in enumerate(CATEGORY_TABS_ORDER, start=1):
         guidance = TOPICS[topic]
@@ -682,15 +753,16 @@ def run_watchdog(
             window_days=window_days,
         )
 
+        # Inject extra URLs ONLY under Local category (so they are not repeated 9 times)
+        if topic == LOCAL_CATEGORY and effective_extra_urls:
+            sources = _sources_from_urls(effective_extra_urls, topic) + sources
+
         # Deduplicate by URL
-        seen_urls = set()
-        uniq = []
-        for s in sources:
-            u = (s.get("url") or "").strip()
-            if not u or u in seen_urls:
-                continue
-            seen_urls.add(u)
-            uniq.append(s)
+        sources = _dedupe_sources_by_url(sources)
+
+        # Split seed vs non-seed
+        seed_sources = [s for s in sources if s.get("_seed")]
+        non_seed_sources = [s for s in sources if not s.get("_seed")]
 
         if progress_callback:
             try:
@@ -698,15 +770,16 @@ def run_watchdog(
             except Exception:
                 pass
 
-        # Pass 2: rerank to pick best primary/recent sources
-        selected = _rerank_sources(
+        # Rerank only non-seeds; seeds always kept
+        selected_non_seed = _rerank_sources(
             llm=llm,
             model_id=model_id,
             topic=topic,
             window_days=window_days,
-            sources=uniq,
+            sources=non_seed_sources,
             k=int(rerank_top_k),
         )
+        selected = _dedupe_sources_by_url(seed_sources + selected_non_seed)
 
         if progress_callback:
             try:
@@ -714,9 +787,11 @@ def run_watchdog(
             except Exception:
                 pass
 
-        # Fetch full text for top N sources (cached)
+        # Always fetch ALL seeds, plus top N non-seeds
+        fetch_list = _dedupe_sources_by_url(seed_sources + selected_non_seed[: int(fetch_fulltext_top_k)])
+
         fulltexts: Dict[str, str] = {}
-        for s in selected[: int(fetch_fulltext_top_k)]:
+        for s in fetch_list:
             url = (s.get("url") or "").strip()
             if not url:
                 continue
@@ -731,7 +806,6 @@ def run_watchdog(
             if txt:
                 fulltexts[url] = txt
 
-        # Persist cache periodically
         _save_fetch_cache(cache)
 
         if progress_callback:
@@ -740,7 +814,6 @@ def run_watchdog(
             except Exception:
                 pass
 
-        # Build richer context and extract structured items
         context = _build_context_from_sources(
             sources=selected,
             fulltexts=fulltexts,
