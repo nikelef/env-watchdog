@@ -1,3 +1,4 @@
+# app.py
 import os
 from datetime import datetime, timezone
 from typing import List
@@ -12,6 +13,7 @@ from env_watchdog import (
     load_latest_run,
     CATEGORY_TABS_ORDER,
     LOCAL_CATEGORY,
+    DEFAULT_EXTRA_URLS,   # NEW: used to prefill the UI
 )
 
 ALERT_RECIPIENT = "neleftheriou@tms-dry.com"
@@ -117,7 +119,6 @@ def build_email_draft(recipient: str, item: dict, paragraph: str, today_utc: str
 
 
 def _category_df(cat_items: list, latest_added_ids: set[str]) -> pd.DataFrame:
-    # Defensive dedupe by id for display
     seen = set()
     deduped = []
     for it in cat_items:
@@ -145,10 +146,29 @@ def _category_df(cat_items: list, latest_added_ids: set[str]) -> pd.DataFrame:
                 "Instrument": it.get("instrument", ""),
                 "Practical summary": it.get("summary", ""),
                 "URL": url,
-                "_id": _id,  # internal mapping
+                "_id": _id,
             }
         )
     return pd.DataFrame(rows)
+
+
+def _parse_urls_text(raw: str) -> List[str]:
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    parts: List[str] = []
+    for line in raw.splitlines():
+        parts.extend([p.strip() for p in line.split(",") if p.strip()])
+    out: List[str] = []
+    seen = set()
+    for u in parts:
+        if not u.startswith("https://"):
+            continue
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
 
 
 with st.sidebar:
@@ -170,7 +190,17 @@ with st.sidebar:
     include_domains = st.text_area(
         "Preferred domains (optional, comma-separated)",
         value=os.environ.get("PREFERRED_DOMAINS", ""),
-        help="Example: imo.org, europa.eu, amsa.gov.au, uscg.mil, epa.gov, carbc.ca.gov, dnv.com, lr.org",
+        help="Example: imo.org, europa.eu, amsa.gov.au, uscg.mil, epa.gov, carb.ca.gov, dnv.com, lr.org",
+    )
+
+    st.divider()
+    st.subheader("Always-read URLs (in addition to search)")
+    default_urls_text = os.environ.get("WATCHDOG_EXTRA_URLS", "\n".join(DEFAULT_EXTRA_URLS))
+    extra_urls_text = st.text_area(
+        "Paste URLs (one per line)",
+        value=default_urls_text,
+        height=220,
+        help="These URLs are always fetched/read and injected under the Local category, even if Tavily fails.",
     )
 
     st.divider()
@@ -180,6 +210,9 @@ with st.sidebar:
     st.divider()
     st.caption("Streamlit Cloud Secrets required:")
     st.code('TAVILY_API_KEY="..."\nGROQ_API_KEY="..."\nGROQ_MODEL="llama-3.1-8b-instant"', language="text")
+    st.caption("Optional (to persist URLs via Secrets):")
+    st.code('WATCHDOG_EXTRA_URLS="https://...\\nhttps://..."', language="text")
+
 
 if auto_refresh:
     st.autorefresh(interval=int(refresh_minutes) * 60 * 1000, key="autorefresh")
@@ -196,17 +229,21 @@ PHASE_LABELS = {
     "extract": "Extracting updates",
 }
 
+
 def _progress_cb(topic: str, idx: int, total: int, phase: str) -> None:
     phase_txt = PHASE_LABELS.get(phase, phase)
     status_box.update(label=f"{phase_txt}: {idx}/{total} — {topic}", state="running", expanded=False)
     pct = int((idx / max(total, 1)) * 100)
     progress_bar.progress(pct)
 
+
 today_utc = _today_utc_iso(today_override)
 
 if run_now or auto_refresh:
     status_box.update(label="Starting run…", state="running", expanded=False)
     progress_bar.progress(0)
+
+    extra_urls = _parse_urls_text(extra_urls_text)
 
     result = run_watchdog(
         today_utc=today_utc,
@@ -221,6 +258,7 @@ if run_now or auto_refresh:
         fetch_cache_ttl_hours=int(fetch_cache_ttl_hours),
         polite_delay_sec=float(polite_delay_sec),
         progress_callback=_progress_cb,
+        extra_urls=extra_urls,  # NEW
     )
 
     status_box.update(label=f"Run completed at {result['timestamp_utc']} UTC", state="complete", expanded=False)
@@ -261,7 +299,6 @@ for cat in CATEGORY_TABS_ORDER:
             st.info("No items stored for this category.")
             continue
 
-        # NOTE: st.data_editor does not support pandas Styler reliably. We show a "Latest" marker + CSS wrap.
         edited = st.data_editor(
             df.drop(columns=[], errors="ignore"),
             hide_index=True,
