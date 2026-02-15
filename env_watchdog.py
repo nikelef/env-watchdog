@@ -4,14 +4,20 @@ from __future__ import annotations
 import os
 import json
 import hashlib
+import argparse
+import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any, Tuple
+from urllib.parse import urlparse
 
 import requests
 from openai import OpenAI
 from tavily import TavilyClient
+
+
+LOGGER = logging.getLogger("env_watchdog")
 
 
 # -------------------------
@@ -90,6 +96,24 @@ DEFAULT_EXTRA_URLS: List[str] = [
     "https://decarbonization.krs.co.kr/eng/Exclusive/Tech_ETC.aspx?MRID=973&URID=0",
     "https://www.bureauveritas.gr/newsroom",
 ]
+
+PREFERRED_PRIMARY_DOMAINS = {
+    "imo.org",
+    "europa.eu",
+    "ec.europa.eu",
+    "eur-lex.europa.eu",
+    "uscg.mil",
+    "epa.gov",
+    "amsa.gov.au",
+    "gov.uk",
+    "dnv.com",
+    "lr.org",
+    "bureauveritas.com",
+    "classnk.or.jp",
+    "krs.co.kr",
+    "ccs.org.cn",
+    "iacs.org.uk",
+}
 
 
 # -------------------------
@@ -204,6 +228,16 @@ def _groq_client() -> OpenAI:
     return OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
 
 
+
+
+def get_missing_credentials() -> List[str]:
+    missing: List[str] = []
+    if not os.environ.get("TAVILY_API_KEY", "").strip():
+        missing.append("TAVILY_API_KEY")
+    if not os.environ.get("GROQ_API_KEY", "").strip():
+        missing.append("GROQ_API_KEY")
+    return missing
+
 # -------------------------
 # Extra URL feeding (simple)
 # -------------------------
@@ -248,6 +282,50 @@ def _sources_from_urls(urls: List[str], topic: str, score: float = 999.0) -> Lis
         )
     return out
 
+
+
+
+def _parse_iso_date(value: str) -> Optional[datetime]:
+    v = (value or '').strip()
+    if not v:
+        return None
+    for fmt in ('%Y-%m-%d','%Y-%m','%Y/%m/%d'):
+        try:
+            return datetime.strptime(v, fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+    return None
+
+
+def _domain_of_url(url: str) -> str:
+    try:
+        host = (urlparse(url).hostname or '').lower()
+    except Exception:
+        return ''
+    return host[4:] if host.startswith('www.') else host
+
+
+def _is_preferred_domain(url: str) -> bool:
+    host = _domain_of_url(url)
+    if not host:
+        return False
+    for d in PREFERRED_PRIMARY_DOMAINS:
+        if host == d or host.endswith('.' + d):
+            return True
+    return False
+
+
+def _normalize_source_date(source: dict) -> str:
+    for key in ('published_date','publishedDate','date','updated_date'):
+        raw = source.get(key)
+        if not raw:
+            continue
+        txt = str(raw).strip()
+        if len(txt) >= 10:
+            cand = txt[:10]
+            if _parse_iso_date(cand):
+                return cand
+    return 'date unclear'
 
 def _dedupe_sources_by_url(sources: List[dict]) -> List[dict]:
     seen = set()
@@ -338,6 +416,8 @@ def _search_topic(
     results = res.get("results", []) if isinstance(res, dict) else []
     for r in results:
         r["_topic"] = topic_name
+        r["_source_date"] = _normalize_source_date(r)
+    LOGGER.info("search_topic topic=%s results=%s", topic_name, len(results))
     return results
 
 
@@ -515,11 +595,30 @@ def _rerank_sources(
         pass
 
     def _score(s):
+        base = 0.0
         v = s.get("score")
         try:
-            return float(v)
+            base += float(v)
         except Exception:
-            return 0.0
+            pass
+
+        if _is_preferred_domain(s.get("url", "")):
+            base += 3.0
+
+        dt = _parse_iso_date(s.get("_source_date", ""))
+        if dt:
+            age_days = (datetime.now(timezone.utc) - dt).days
+            if age_days <= max(window_days, 30):
+                base += 2.0
+            elif age_days <= max(window_days * 2, 120):
+                base += 0.8
+            else:
+                base -= 0.8
+
+        title = (s.get("title") or "").lower()
+        if any(token in title for token in ("amend", "circular", "resolution", "regulation", "guideline", "update")):
+            base += 1.2
+        return base
 
     return sorted(sources, key=_score, reverse=True)[:k]
 
@@ -599,6 +698,31 @@ def _date_sort_key(date_str: str) -> Tuple[int, str]:
         return (0, "")
     return (0, "")
 
+
+
+
+def _is_item_within_window(item: dict, today_utc: str, window_days: int) -> bool:
+    ds = (item.get('date') or '').strip()
+    dt = _parse_iso_date(ds)
+    if not dt:
+        return True
+    ref = _parse_iso_date(today_utc) or datetime.now(timezone.utc)
+    return (ref - timedelta(days=window_days)) <= dt <= (ref + timedelta(days=5))
+
+
+def _passes_quality_gate(item: dict, selected_sources: List[dict]) -> bool:
+    url = item.get('url', '')
+    if url and url != 'link unavailable':
+        if _is_preferred_domain(url):
+            return True
+        selected_urls = {(s.get('url') or '').strip() for s in selected_sources}
+        if url in selected_urls:
+            return True
+
+    summary = (item.get('summary') or '').strip().lower()
+    if len(summary) < 40 or 'summary unclear' in summary:
+        return False
+    return True
 
 def _extract_updates(
     llm: OpenAI,
@@ -713,6 +837,10 @@ def run_watchdog(
     # NEW: feed specific URLs (read regardless of Tavily)
     extra_urls: Optional[List[str]] = None,
 ) -> dict:
+    missing = get_missing_credentials()
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+
     tav = _tavily_client()
     llm = _groq_client()
     model_id = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
@@ -829,6 +957,13 @@ def run_watchdog(
             window_days=window_days,
             context=context,
         )
+        extracted = [
+            it for it in extracted
+            if _is_item_within_window(it, today_utc=today_utc, window_days=int(window_days))
+            and _passes_quality_gate(it, selected_sources=selected)
+        ]
+
+        LOGGER.info("extract topic=%s accepted=%s", topic, len(extracted))
 
         for item in extracted:
             item_id = _item_id(item)
@@ -858,3 +993,60 @@ def run_watchdog(
         "added": additions,
         "all_items": existing_items,
     }
+
+
+def run_continuous(interval_minutes: int, **kwargs) -> None:
+    interval_seconds = max(60, int(interval_minutes) * 60)
+    LOGGER.info("Starting continuous watchdog loop interval=%ss", interval_seconds)
+    while True:
+        started = time.time()
+        today_utc = datetime.now(timezone.utc).date().isoformat()
+        try:
+            result = run_watchdog(today_utc=today_utc, **kwargs)
+            LOGGER.info(
+                "run_complete timestamp=%s added=%s total_items=%s",
+                result.get("timestamp_utc"),
+                len(result.get("added") or []),
+                len(result.get("all_items") or []),
+            )
+        except Exception as exc:
+            LOGGER.exception("run_failed error=%s", exc)
+
+        elapsed = time.time() - started
+        sleep_for = max(5, interval_seconds - int(elapsed))
+        LOGGER.info("sleeping_for=%ss", sleep_for)
+        time.sleep(sleep_for)
+
+
+def _cli() -> None:
+    parser = argparse.ArgumentParser(description="Environmental watchdog runner")
+    parser.add_argument("--once", action="store_true", help="Run once and exit")
+    parser.add_argument("--continuous", action="store_true", help="Run continuously")
+    parser.add_argument("--interval-minutes", type=int, default=int(os.environ.get("REFRESH_SECONDS", "3600")) // 60)
+    parser.add_argument("--search-depth", default=os.environ.get("TAVILY_SEARCH_DEPTH", "advanced"))
+    parser.add_argument("--window-days", type=int, default=int(os.environ.get("WINDOW_DAYS", "730")))
+    parser.add_argument("--max-results", type=int, default=int(os.environ.get("MAX_RESULTS_PER_TOPIC", "12")))
+    parser.add_argument("--local-results", type=int, default=int(os.environ.get("LOCAL_RESULTS_PER_TOPIC", "30")))
+    args = parser.parse_args()
+
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+
+    kwargs = {
+        "tavily_search_depth": args.search_depth,
+        "window_days": args.window_days,
+        "max_results_per_topic": args.max_results,
+        "local_results_per_topic": args.local_results,
+        "extra_urls": _parse_urls_text(os.environ.get("WATCHDOG_EXTRA_URLS", "\n".join(DEFAULT_EXTRA_URLS))),
+    }
+
+    if args.continuous and not args.once:
+        run_continuous(interval_minutes=args.interval_minutes, **kwargs)
+        return
+
+    today_utc = datetime.now(timezone.utc).date().isoformat()
+    out = run_watchdog(today_utc=today_utc, **kwargs)
+    print(json.dumps({"timestamp_utc": out.get("timestamp_utc"), "added": len(out.get("added") or [])}, ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    _cli()
