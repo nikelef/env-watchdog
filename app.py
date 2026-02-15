@@ -12,7 +12,6 @@ from env_watchdog import (
     load_latest_run,
     load_state,
     run_watchdog,
-    get_missing_credentials,
 )
 
 st.set_page_config(page_title="Env Watchdog", layout="wide")
@@ -20,31 +19,13 @@ st.title("Env Watchdog")
 st.caption("Focused maritime environmental regulatory monitoring.")
 
 
-
-
-def _load_key(name: str) -> str:
-    env_val = os.environ.get(name, "").strip()
-    if env_val:
-        return env_val
-    try:
-        secret_val = str(st.secrets.get(name, "")).strip()
-    except Exception:
-        secret_val = ""
-    if secret_val:
-        os.environ[name] = secret_val
-    return secret_val
-
-
-def _required_keys_present() -> bool:
-    _load_key("TAVILY_API_KEY")
-    _load_key("GROQ_API_KEY")
-    return len(get_missing_credentials()) == 0
-
-
 def _today_utc_iso() -> str:
     override = os.environ.get("TODAY_OVERRIDE", "").strip()
     return override or datetime.now(timezone.utc).date().isoformat()
 
+st.set_page_config(page_title="Env Watchdog", layout="wide")
+st.title("Env Watchdog")
+st.caption("Focused maritime environmental regulatory monitoring.")
 
 def _parse_domains(raw: str):
     vals = [p.strip() for p in (raw or "").split(",") if p.strip()]
@@ -82,7 +63,7 @@ def _to_df(items: list, latest_ids: set[str]) -> pd.DataFrame:
 
 with st.sidebar:
     st.subheader("Run settings")
-    auto_refresh = st.toggle("Continuous mode", value=False)
+    auto_refresh = st.toggle("Continuous mode", value=True)
     refresh_minutes = st.slider("Run interval (minutes)", min_value=5, max_value=720, value=120, step=5)
     window_days = st.slider("Lookback window (days)", min_value=30, max_value=1825, value=int(os.environ.get("WINDOW_DAYS", "730")), step=30)
     max_results = st.slider("Search results per topic", min_value=5, max_value=40, value=int(os.environ.get("MAX_RESULTS_PER_TOPIC", "12")))
@@ -101,25 +82,17 @@ if auto_refresh:
 run_now = st.button("Run now", type="primary")
 
 if run_now or auto_refresh:
-    if not _required_keys_present():
-        missing = ", ".join(get_missing_credentials())
-        st.error(f"Missing required secrets: {missing}. Set them in Streamlit Secrets or environment variables.")
-    else:
-        with st.status("Running watchdog...", expanded=False) as status:
-            try:
-                result = run_watchdog(
-                    today_utc=_today_utc_iso(),
-                    tavily_search_depth=search_depth,
-                    window_days=window_days,
-                    max_results_per_topic=max_results,
-                    local_results_per_topic=local_results,
-                    preferred_domains=_parse_domains(preferred_domains),
-                    extra_urls=_parse_urls_text(extra_urls_text),
-                )
-                status.update(label=f"Completed. New updates: {len(result.get('added') or [])}", state="complete")
-            except Exception as exc:
-                status.update(label="Run failed", state="error", expanded=True)
-                st.exception(exc)
+    with st.status("Running watchdog...", expanded=False) as status:
+        result = run_watchdog(
+            today_utc=_today_utc_iso(),
+            tavily_search_depth=search_depth,
+            window_days=window_days,
+            max_results_per_topic=max_results,
+            local_results_per_topic=local_results,
+            preferred_domains=_parse_domains(preferred_domains),
+            extra_urls=_parse_urls_text(extra_urls_text),
+        )
+        status.update(label=f"Completed. New updates: {len(result.get('added') or [])}", state="complete")
 
 latest_run = load_latest_run()
 latest_added_ids = {it.get("id") for it in (latest_run.get("additions") or []) if isinstance(it, dict)}
