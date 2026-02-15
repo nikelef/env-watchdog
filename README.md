@@ -1,41 +1,56 @@
-Environmental Specialist Watch Dog (Streamlit + Ollama + Tavily)
+# Environmental Specialist Watch Dog
 
-What it does
-- Pulls recent web sources per topic (Tavily Search)
-- Summarizes with a local Ollama model
-- Enforces strict output format:
-  - Either EXACT: NO_UPDATES
-  - Or up to 8 bullets: "- Authority - Instrument - Date - short practical summary - URL"
-- Posts results by saving:
-  - data/latest.txt
-  - data/history.jsonl
+A Streamlit + Tavily + Groq app that continuously monitors maritime environmental regulatory updates, stores deduplicated findings, and shows a simplified UI.
 
-Prerequisites
-1) Install Ollama: https://github.com/ollama/ollama
-2) Pull the default model:
-   ollama pull qwen2.5:7b-instruct
-   (Optional alternative)
-   ollama pull llama3.1:8b
+## What improved
+- Better source quality: preferred-domain and freshness-aware scoring fallback.
+- Better output quality: post-extraction quality gate + strict time-window validation.
+- Continuous execution options:
+  - **UI continuous mode** (auto-refresh + rerun).
+  - **CLI daemon mode** (`python env_watchdog.py --continuous`).
+- Simpler UI: fewer controls, cleaner results table, clear new-item counts.
 
-3) Create a Tavily API key: https://docs.tavily.com/
+## Prerequisites
+- Python 3.11+
+- Tavily API key
+- Groq API key
 
-Setup
-- Create a virtual environment, install dependencies:
-  pip install -r requirements.txt
+Install dependencies:
+```bash
+pip install -r requirements.txt
+```
 
-Environment variables
-- TAVILY_API_KEY=...
-- OLLAMA_MODEL=qwen2.5:7b-instruct
-- TODAY_OVERRIDE=YYYY-MM-DD   (optional)
-- MAX_RESULTS_PER_TOPIC=5     (optional)
-- TAVILY_SEARCH_DEPTH=advanced (optional)
-- PREFERRED_DOMAINS=imo.org,europa.eu,amsa.gov.au,uscg.mil,dnv.com (optional)
-- DATA_DIR=data (optional)
-- REFRESH_SECONDS=3600 (optional)
+## Environment variables
+Required:
+- `TAVILY_API_KEY`
+- `GROQ_API_KEY`
 
-Run
-- streamlit run app.py
+Optional:
+- `GROQ_MODEL` (default: `llama-3.1-8b-instant`)
+- `WATCHDOG_EXTRA_URLS` (newline separated https URLs)
+- `WINDOW_DAYS` (default 730)
+- `MAX_RESULTS_PER_TOPIC` (default 12)
+- `LOCAL_RESULTS_PER_TOPIC` (default 30)
+- `DATA_DIR` (default `data`)
+- `REFRESH_SECONDS` (default 3600; used by CLI defaults)
 
-Notes
-- The local model does not browse the web itself; Tavily provides retrieval.
-- If the model output violates format rules, the app will fall back to NO_UPDATES.
+## Run Streamlit UI
+```bash
+streamlit run app.py
+```
+Enable **Continuous mode** in sidebar to keep running at intervals.
+
+## Run in terminal continuously
+```bash
+python env_watchdog.py --continuous --interval-minutes 60
+```
+
+Single run:
+```bash
+python env_watchdog.py --once
+```
+
+## Storage
+- `data/state.json` — merged deduplicated items
+- `data/latest_run.json` — items added in latest run
+- `data/fetch_cache.json` — URL text cache
