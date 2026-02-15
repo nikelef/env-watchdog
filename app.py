@@ -19,8 +19,23 @@ st.title("Env Watchdog")
 st.caption("Focused maritime environmental regulatory monitoring.")
 
 
+
+
+def _load_key(name: str) -> str:
+    env_val = os.environ.get(name, "").strip()
+    if env_val:
+        return env_val
+    try:
+        secret_val = str(st.secrets.get(name, "")).strip()
+    except Exception:
+        secret_val = ""
+    if secret_val:
+        os.environ[name] = secret_val
+    return secret_val
+
+
 def _required_keys_present() -> bool:
-    return bool(os.environ.get("TAVILY_API_KEY", "").strip()) and bool(os.environ.get("GROQ_API_KEY", "").strip())
+    return bool(_load_key("TAVILY_API_KEY")) and bool(_load_key("GROQ_API_KEY"))
 
 
 def _today_utc_iso() -> str:
@@ -84,7 +99,7 @@ run_now = st.button("Run now", type="primary")
 
 if run_now or auto_refresh:
     if not _required_keys_present():
-        st.error("Missing required secrets: set TAVILY_API_KEY and GROQ_API_KEY before running.")
+        st.error("Missing required secrets: set TAVILY_API_KEY and GROQ_API_KEY in Streamlit Secrets or environment variables.")
     else:
         with st.status("Running watchdog...", expanded=False) as status:
             try:
