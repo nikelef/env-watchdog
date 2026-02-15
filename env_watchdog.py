@@ -1,24 +1,30 @@
 # env_watchdog.py
 from __future__ import annotations
 
-import os
-import json
-import hashlib
 import argparse
+import hashlib
+import json
 import logging
+import os
 import re
 import time
-from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Any, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
 from openai import OpenAI
 from tavily import TavilyClient
 
-
 LOGGER = logging.getLogger("env_watchdog")
 
+# Optional: load .env locally (ignored on Streamlit Cloud)
+try:
+    from dotenv import load_dotenv  # type: ignore
+
+    load_dotenv()
+except Exception:
+    pass
 
 # -------------------------
 # Categories / Topics
@@ -75,13 +81,10 @@ CATEGORY_TABS_ORDER = [
     "Anti-fouling Systems (AFS Convention)",
     "Regional / local regimes (EU, US, AUS, etc.)",
 ]
-
 LOCAL_CATEGORY = "Regional / local regimes (EU, US, AUS, etc.)"
 
 # -------------------------
 # User-provided seed URLs (always read)
-# - These will be fetched and included even if Tavily fails.
-# - By default they are injected ONLY into LOCAL_CATEGORY.
 # -------------------------
 DEFAULT_EXTRA_URLS: List[str] = [
     "https://www.amsa.gov.au/about/regulations-and-standards/index-marine-notices",
@@ -114,7 +117,6 @@ PREFERRED_PRIMARY_DOMAINS = {
     "ccs.org.cn",
     "iacs.org.uk",
 }
-
 
 # -------------------------
 # Storage (merge-only; dedupe; cache)
@@ -212,40 +214,53 @@ def _save_fetch_cache(cache: dict) -> None:
 
 
 # -------------------------
+# Secrets helper (works both locally + Streamlit Cloud)
+# -------------------------
+def _get_secret(name: str) -> str:
+    v = (os.environ.get(name) or "").strip()
+    if v:
+        return v
+    try:
+        import streamlit as st  # type: ignore
+
+        v2 = st.secrets.get(name, "")
+        return str(v2).strip()
+    except Exception:
+        return ""
+
+
+# -------------------------
 # Clients
 # -------------------------
 def _tavily_client() -> TavilyClient:
-    key = os.environ.get("TAVILY_API_KEY", "").strip()
+    key = _get_secret("TAVILY_API_KEY")
     if not key:
-        raise RuntimeError("Missing TAVILY_API_KEY environment variable.")
+        raise RuntimeError("Missing TAVILY_API_KEY.")
     return TavilyClient(api_key=key)
 
 
 def _groq_client() -> OpenAI:
-    key = os.environ.get("GROQ_API_KEY", "").strip()
+    key = _get_secret("GROQ_API_KEY")
     if not key:
-        raise RuntimeError("Missing GROQ_API_KEY environment variable.")
+        raise RuntimeError("Missing GROQ_API_KEY.")
+    # Groq OpenAI-compatible endpoint
     return OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
-
-
 
 
 def get_missing_credentials() -> List[str]:
     missing: List[str] = []
-    if not os.environ.get("TAVILY_API_KEY", "").strip():
+    if not _get_secret("TAVILY_API_KEY"):
         missing.append("TAVILY_API_KEY")
-    if not os.environ.get("GROQ_API_KEY", "").strip():
+    if not _get_secret("GROQ_API_KEY"):
         missing.append("GROQ_API_KEY")
     return missing
+
 
 # -------------------------
 # Extra URL feeding (simple)
 # -------------------------
 def _parse_urls_text(raw: str) -> List[str]:
-    """
-    Parse newline- or comma-separated URLs from UI/env.
-    Keeps https:// only, dedupes.
-    """
+    """Parse newline- or comma-separated URLs. Keeps https:// only, dedupes."""
     raw = (raw or "").strip()
     if not raw:
         return []
@@ -283,13 +298,11 @@ def _sources_from_urls(urls: List[str], topic: str, score: float = 999.0) -> Lis
     return out
 
 
-
-
 def _parse_iso_date(value: str) -> Optional[datetime]:
-    v = (value or '').strip()
+    v = (value or "").strip()
     if not v:
         return None
-    for fmt in ('%Y-%m-%d','%Y-%m','%Y/%m/%d'):
+    for fmt in ("%Y-%m-%d", "%Y-%m", "%Y/%m/%d"):
         try:
             return datetime.strptime(v, fmt).replace(tzinfo=timezone.utc)
         except Exception:
@@ -299,10 +312,10 @@ def _parse_iso_date(value: str) -> Optional[datetime]:
 
 def _domain_of_url(url: str) -> str:
     try:
-        host = (urlparse(url).hostname or '').lower()
+        host = (urlparse(url).hostname or "").lower()
     except Exception:
-        return ''
-    return host[4:] if host.startswith('www.') else host
+        return ""
+    return host[4:] if host.startswith("www.") else host
 
 
 def _is_preferred_domain(url: str) -> bool:
@@ -310,13 +323,13 @@ def _is_preferred_domain(url: str) -> bool:
     if not host:
         return False
     for d in PREFERRED_PRIMARY_DOMAINS:
-        if host == d or host.endswith('.' + d):
+        if host == d or host.endswith("." + d):
             return True
     return False
 
 
 def _normalize_source_date(source: dict) -> str:
-    for key in ('published_date','publishedDate','date','updated_date'):
+    for key in ("published_date", "publishedDate", "date", "updated_date"):
         raw = source.get(key)
         if not raw:
             continue
@@ -325,7 +338,8 @@ def _normalize_source_date(source: dict) -> str:
             cand = txt[:10]
             if _parse_iso_date(cand):
                 return cand
-    return 'date unclear'
+    return "date unclear"
+
 
 def _dedupe_sources_by_url(sources: List[dict]) -> List[dict]:
     seen = set()
@@ -356,11 +370,9 @@ def _search_topic(
         f"(IMO OR MEPC OR flag circular OR port state OR regulator OR class technical news) "
         f"last {window_days} days"
     )
-
-    kwargs = {}
+    kwargs: Dict[str, Any] = {}
     if preferred_domains:
-        # Ensure Tavily gets domains, not URLs
-        clean = []
+        clean: List[str] = []
         for d in preferred_domains:
             d = (d or "").strip()
             if not d:
@@ -380,7 +392,6 @@ def _search_topic(
             include_images=False,
             **kwargs,
         )
-
     except requests.exceptions.HTTPError as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
         text = getattr(getattr(e, "response", None), "text", "")
@@ -397,7 +408,6 @@ def _search_topic(
             ),
         )
         return []
-
     except Exception as e:
         print(
             "TAVILY_SEARCH_ERROR:",
@@ -441,6 +451,7 @@ def _fetch_url_text(
         return ""
 
     now = datetime.now(timezone.utc)
+
     cached = cache.get(url)
     if isinstance(cached, dict):
         ts = cached.get("fetched_at_utc")
@@ -457,21 +468,18 @@ def _fetch_url_text(
     if polite_delay_sec > 0:
         time.sleep(polite_delay_sec)
 
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; EnvWatchdog/1.0; +https://example.invalid)"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; EnvWatchdog/1.0; +https://github.com/nikelef/env-watchdog)"
+    }
     try:
         r = requests.get(url, headers=headers, timeout=timeout_sec)
         if r.status_code >= 400:
             return ""
         content_type = (r.headers.get("content-type") or "").lower()
-
         if "pdf" in content_type or url.lower().endswith(".pdf"):
-            # No PDF parsing here (avoids heavy deps).
-            return ""
-
+            return ""  # no PDF parsing in this lightweight build
         html = r.text or ""
-        text = _strip_html(html)
-        text = text[:max_chars].strip()
-
+        text = _strip_html(html)[:max_chars].strip()
         if text:
             cache[url] = {"fetched_at_utc": now.isoformat(timespec="seconds"), "text": text}
         return text
@@ -486,20 +494,15 @@ def _build_context_from_sources(
 ) -> str:
     chunks: List[str] = []
     total = 0
-
     for s in sources:
         topic = (s.get("_topic") or "").strip()
         title = (s.get("title") or "").strip()
         url = (s.get("url") or "").strip()
         snippet = (s.get("content") or s.get("snippet") or "").strip()
-
         if not url:
             continue
 
-        body = fulltexts.get(url) or ""
-        if not body:
-            body = snippet
-
+        body = fulltexts.get(url) or snippet
         if not body:
             continue
 
@@ -519,6 +522,21 @@ RERANK_SYSTEM = (
     "You are selecting best primary sources for maritime environmental regulatory updates. "
     "Prefer official/primary sources (IMO, flags, regulators, class). Prefer items that are clearly "
     "recent within the provided window. Avoid blogs or low-quality sites."
+)
+
+EXTRACT_SYSTEM = (
+    "You are an Environmental Specialist Watch Dog for an international ship management company. "
+    "You extract only regulatory developments within a time window defined by the user. "
+    "Prefer official sources (IMO, flags, regulators, class) and ignore older baseline rules.\n\n"
+    "Return STRICT JSON only: a JSON array of objects. No markdown. No extra text.\n"
+    "Each object must have keys:\n"
+    "category, authority, instrument, date, summary, url\n"
+    "date must be 'YYYY-MM-DD' if known; else 'date unclear'.\n"
+    "summary MUST be exactly 2 lines (two sentences max total), practical and action-oriented: "
+    "line 1 = operational impact; line 2 = documentation/survey/inspection action. "
+    "Separate the two lines with a newline character (\\n).\n"
+    "Do not use bullet symbols.\n"
+    "url must be https or 'link unavailable'."
 )
 
 
@@ -573,10 +591,7 @@ def _rerank_sources(
     try:
         resp = llm.chat.completions.create(
             model=model_id,
-            messages=[
-                {"role": "system", "content": RERANK_SYSTEM},
-                {"role": "user", "content": prompt},
-            ],
+            messages=[{"role": "system", "content": RERANK_SYSTEM}, {"role": "user", "content": prompt}],
             temperature=0.1,
         )
         raw = (resp.choices[0].message.content or "").strip()
@@ -585,26 +600,25 @@ def _rerank_sources(
             wanted = [u for u in arr if isinstance(u, str) and u.startswith("http")]
             wanted_set = set(wanted)
             out = [s for s in sources if (s.get("url") or "") in wanted_set]
-            out_sorted = []
             by_url = {s.get("url"): s for s in out}
+            ordered: List[dict] = []
             for u in wanted:
                 if u in by_url:
-                    out_sorted.append(by_url[u])
-            return out_sorted[:k]
+                    ordered.append(by_url[u])
+            return ordered[:k]
     except Exception:
         pass
 
-    def _score(s):
+    # fallback ranking
+    def _score(s: dict) -> float:
         base = 0.0
         v = s.get("score")
         try:
             base += float(v)
         except Exception:
             pass
-
         if _is_preferred_domain(s.get("url", "")):
             base += 3.0
-
         dt = _parse_iso_date(s.get("_source_date", ""))
         if dt:
             age_days = (datetime.now(timezone.utc) - dt).days
@@ -614,28 +628,12 @@ def _rerank_sources(
                 base += 0.8
             else:
                 base -= 0.8
-
         title = (s.get("title") or "").lower()
         if any(token in title for token in ("amend", "circular", "resolution", "regulation", "guideline", "update")):
             base += 1.2
         return base
 
     return sorted(sources, key=_score, reverse=True)[:k]
-
-
-EXTRACT_SYSTEM = (
-    "You are an Environmental Specialist Watch Dog for an international ship management company. "
-    "You extract only regulatory developments within a time window defined by the user. "
-    "Prefer official sources (IMO, flags, regulators, class) and ignore older baseline rules.\n\n"
-    "Return STRICT JSON only: a JSON array of objects. No markdown. No extra text.\n"
-    "Each object must have keys:\n"
-    "category, authority, instrument, date, summary, url\n"
-    "date must be 'YYYY-MM-DD' if known; else 'date unclear'.\n"
-    "summary MUST be exactly 2 lines (two sentences max total), practical and action-oriented: "
-    "line 1 = operational impact; line 2 = documentation/survey/inspection action. "
-    "Separate the two lines with a newline character (\\n). Do not use bullet symbols.\n"
-    "url must be https or 'link unavailable'."
-)
 
 
 def _normalize_item(x: dict, fallback_category: str) -> Optional[dict]:
@@ -660,12 +658,7 @@ def _normalize_item(x: dict, fallback_category: str) -> Optional[dict]:
     else:
         summary = "summary unclear\nAction: Review/implement and update documentation as applicable."
 
-    if (
-        authority == "authority unclear"
-        and instrument == "instrument unclear"
-        and summary.startswith("summary unclear")
-        and url == "link unavailable"
-    ):
+    if authority == "authority unclear" and instrument == "instrument unclear" and summary.startswith("summary unclear") and url == "link unavailable":
         return None
 
     return {
@@ -699,10 +692,8 @@ def _date_sort_key(date_str: str) -> Tuple[int, str]:
     return (0, "")
 
 
-
-
 def _is_item_within_window(item: dict, today_utc: str, window_days: int) -> bool:
-    ds = (item.get('date') or '').strip()
+    ds = (item.get("date") or "").strip()
     dt = _parse_iso_date(ds)
     if not dt:
         return True
@@ -711,18 +702,19 @@ def _is_item_within_window(item: dict, today_utc: str, window_days: int) -> bool
 
 
 def _passes_quality_gate(item: dict, selected_sources: List[dict]) -> bool:
-    url = item.get('url', '')
-    if url and url != 'link unavailable':
+    url = item.get("url", "")
+    if url and url != "link unavailable":
         if _is_preferred_domain(url):
             return True
-        selected_urls = {(s.get('url') or '').strip() for s in selected_sources}
+        selected_urls = {(s.get("url") or "").strip() for s in selected_sources}
         if url in selected_urls:
             return True
 
-    summary = (item.get('summary') or '').strip().lower()
-    if len(summary) < 40 or 'summary unclear' in summary:
+    summary = (item.get("summary") or "").strip().lower()
+    if len(summary) < 40 or "summary unclear" in summary:
         return False
     return True
+
 
 def _extract_updates(
     llm: OpenAI,
@@ -746,10 +738,7 @@ def _extract_updates(
     try:
         resp = llm.chat.completions.create(
             model=model_id,
-            messages=[
-                {"role": "system", "content": EXTRACT_SYSTEM},
-                {"role": "user", "content": user_prompt},
-            ],
+            messages=[{"role": "system", "content": EXTRACT_SYSTEM}, {"role": "user", "content": user_prompt}],
             temperature=0.1,
         )
         raw = (resp.choices[0].message.content or "").strip()
@@ -825,7 +814,6 @@ def run_watchdog(
     local_results_per_topic: int = 30,
     preferred_domains: Optional[List[str]] = None,
     window_days: int = 730,
-    # quality knobs:
     rerank_top_k: int = 10,
     fetch_fulltext_top_k: int = 6,
     fetch_timeout_sec: int = 20,
@@ -834,31 +822,29 @@ def run_watchdog(
     context_max_total_chars: int = 45000,
     polite_delay_sec: float = 0.4,
     progress_callback=None,
-    # NEW: feed specific URLs (read regardless of Tavily)
     extra_urls: Optional[List[str]] = None,
 ) -> dict:
     missing = get_missing_credentials()
     if missing:
-        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+        raise RuntimeError(f"Missing required secrets: {', '.join(missing)}")
 
     tav = _tavily_client()
     llm = _groq_client()
-    model_id = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+
+    model_id = _get_secret("GROQ_MODEL") or os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 
     cache = _load_fetch_cache()
-
     state = load_state()
+
     existing_items: List[dict] = state.get("items", [])
     if not isinstance(existing_items, list):
         existing_items = []
-
     existing_items = _dedupe_items_keep_first_by_id(existing_items)
     existing_by_id = {it.get("id"): it for it in existing_items if isinstance(it, dict) and it.get("id")}
 
     additions: List[dict] = []
     total = len(CATEGORY_TABS_ORDER)
 
-    # If UI passes nothing, fall back to your fixed list
     effective_extra_urls = (extra_urls or []) or list(DEFAULT_EXTRA_URLS)
 
     for i, topic in enumerate(CATEGORY_TABS_ORDER, start=1):
@@ -871,7 +857,6 @@ def run_watchdog(
                 pass
 
         mr = int(local_results_per_topic) if topic == LOCAL_CATEGORY else int(max_results_per_topic)
-
         sources = _search_topic(
             client=tav,
             topic_name=topic,
@@ -881,14 +866,11 @@ def run_watchdog(
             window_days=window_days,
         )
 
-        # Inject extra URLs ONLY under Local category (so they are not repeated 9 times)
         if topic == LOCAL_CATEGORY and effective_extra_urls:
             sources = _sources_from_urls(effective_extra_urls, topic) + sources
 
-        # Deduplicate by URL
         sources = _dedupe_sources_by_url(sources)
 
-        # Split seed vs non-seed
         seed_sources = [s for s in sources if s.get("_seed")]
         non_seed_sources = [s for s in sources if not s.get("_seed")]
 
@@ -898,7 +880,6 @@ def run_watchdog(
             except Exception:
                 pass
 
-        # Rerank only non-seeds; seeds always kept
         selected_non_seed = _rerank_sources(
             llm=llm,
             model_id=model_id,
@@ -907,6 +888,7 @@ def run_watchdog(
             sources=non_seed_sources,
             k=int(rerank_top_k),
         )
+
         selected = _dedupe_sources_by_url(seed_sources + selected_non_seed)
 
         if progress_callback:
@@ -915,9 +897,7 @@ def run_watchdog(
             except Exception:
                 pass
 
-        # Always fetch ALL seeds, plus top N non-seeds
         fetch_list = _dedupe_sources_by_url(seed_sources + selected_non_seed[: int(fetch_fulltext_top_k)])
-
         fulltexts: Dict[str, str] = {}
         for s in fetch_list:
             url = (s.get("url") or "").strip()
@@ -957,8 +937,10 @@ def run_watchdog(
             window_days=window_days,
             context=context,
         )
+
         extracted = [
-            it for it in extracted
+            it
+            for it in extracted
             if _is_item_within_window(it, today_utc=today_utc, window_days=int(window_days))
             and _passes_quality_gate(it, selected_sources=selected)
         ]
@@ -980,19 +962,15 @@ def run_watchdog(
             existing_by_id[item_id] = new_item
             additions.append(new_item)
 
-    existing_items = _dedupe_items_keep_first_by_id(existing_items)
-    existing_items.sort(key=lambda it: _date_sort_key((it or {}).get("date", "")), reverse=True)
-    existing_items = _dedupe_items_canonical(existing_items)
+        existing_items = _dedupe_items_keep_first_by_id(existing_items)
+        existing_items.sort(key=lambda it: _date_sort_key((it or {}).get("date", "")), reverse=True)
+        existing_items = _dedupe_items_canonical(existing_items)
 
     state["items"] = existing_items
     save_state(state)
     save_latest_run(additions)
 
-    return {
-        "timestamp_utc": _utc_now_iso(),
-        "added": additions,
-        "all_items": existing_items,
-    }
+    return {"timestamp_utc": _utc_now_iso(), "added": additions, "all_items": existing_items}
 
 
 def run_continuous(interval_minutes: int, **kwargs) -> None:
@@ -1022,14 +1000,27 @@ def _cli() -> None:
     parser = argparse.ArgumentParser(description="Environmental watchdog runner")
     parser.add_argument("--once", action="store_true", help="Run once and exit")
     parser.add_argument("--continuous", action="store_true", help="Run continuously")
-    parser.add_argument("--interval-minutes", type=int, default=int(os.environ.get("REFRESH_SECONDS", "3600")) // 60)
+
+    # Backward compatible envs
+    default_interval = int(os.environ.get("REFRESH_MINUTES", "120"))
+    if "REFRESH_SECONDS" in os.environ and "REFRESH_MINUTES" not in os.environ:
+        try:
+            default_interval = max(1, int(os.environ["REFRESH_SECONDS"]) // 60)
+        except Exception:
+            pass
+
+    parser.add_argument("--interval-minutes", type=int, default=default_interval)
     parser.add_argument("--search-depth", default=os.environ.get("TAVILY_SEARCH_DEPTH", "advanced"))
     parser.add_argument("--window-days", type=int, default=int(os.environ.get("WINDOW_DAYS", "730")))
     parser.add_argument("--max-results", type=int, default=int(os.environ.get("MAX_RESULTS_PER_TOPIC", "12")))
     parser.add_argument("--local-results", type=int, default=int(os.environ.get("LOCAL_RESULTS_PER_TOPIC", "30")))
+
     args = parser.parse_args()
 
-    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    )
 
     kwargs = {
         "tavily_search_depth": args.search_depth,
