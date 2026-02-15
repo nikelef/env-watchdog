@@ -23,6 +23,9 @@ def _today_utc_iso() -> str:
     override = os.environ.get("TODAY_OVERRIDE", "").strip()
     return override or datetime.now(timezone.utc).date().isoformat()
 
+st.set_page_config(page_title="Env Watchdog", layout="wide")
+st.title("Env Watchdog")
+st.caption("Focused maritime environmental regulatory monitoring.")
 
 def _parse_domains(raw: str):
     vals = [p.strip() for p in (raw or "").split(",") if p.strip()]

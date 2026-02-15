@@ -228,6 +228,16 @@ def _groq_client() -> OpenAI:
     return OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
 
 
+
+
+def get_missing_credentials() -> List[str]:
+    missing: List[str] = []
+    if not os.environ.get("TAVILY_API_KEY", "").strip():
+        missing.append("TAVILY_API_KEY")
+    if not os.environ.get("GROQ_API_KEY", "").strip():
+        missing.append("GROQ_API_KEY")
+    return missing
+
 # -------------------------
 # Extra URL feeding (simple)
 # -------------------------
@@ -827,6 +837,10 @@ def run_watchdog(
     # NEW: feed specific URLs (read regardless of Tavily)
     extra_urls: Optional[List[str]] = None,
 ) -> dict:
+    missing = get_missing_credentials()
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+
     tav = _tavily_client()
     llm = _groq_client()
     model_id = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
