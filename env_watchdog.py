@@ -12,8 +12,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+import anthropic
 import requests
-from openai import OpenAI
 from tavily import TavilyClient
 
 LOGGER = logging.getLogger("env_watchdog")
@@ -239,20 +239,19 @@ def _tavily_client() -> TavilyClient:
     return TavilyClient(api_key=key)
 
 
-def _groq_client() -> OpenAI:
-    key = _get_secret("GROQ_API_KEY")
+def _anthropic_client() -> anthropic.Anthropic:
+    key = _get_secret("ANTHROPIC_API_KEY")
     if not key:
-        raise RuntimeError("Missing GROQ_API_KEY.")
-    # Groq OpenAI-compatible endpoint
-    return OpenAI(base_url="https://api.groq.com/openai/v1", api_key=key)
+        raise RuntimeError("Missing ANTHROPIC_API_KEY.")
+    return anthropic.Anthropic(api_key=key)
 
 
 def get_missing_credentials() -> List[str]:
     missing: List[str] = []
     if not _get_secret("TAVILY_API_KEY"):
         missing.append("TAVILY_API_KEY")
-    if not _get_secret("GROQ_API_KEY"):
-        missing.append("GROQ_API_KEY")
+    if not _get_secret("ANTHROPIC_API_KEY"):
+        missing.append("ANTHROPIC_API_KEY")
     return missing
 
 
@@ -559,7 +558,7 @@ def _safe_json_loads(text: str) -> Optional[Any]:
 
 
 def _rerank_sources(
-    llm: OpenAI,
+    llm: anthropic.Anthropic,
     model_id: str,
     topic: str,
     window_days: int,
@@ -589,12 +588,14 @@ def _rerank_sources(
     )
 
     try:
-        resp = llm.chat.completions.create(
+        resp = llm.messages.create(
             model=model_id,
-            messages=[{"role": "system", "content": RERANK_SYSTEM}, {"role": "user", "content": prompt}],
+            max_tokens=1024,
+            system=RERANK_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
         )
-        raw = (resp.choices[0].message.content or "").strip()
+        raw = (resp.content[0].text or "").strip()
         arr = _safe_json_loads(raw)
         if isinstance(arr, list):
             wanted = [u for u in arr if isinstance(u, str) and u.startswith("http")]
@@ -717,7 +718,7 @@ def _passes_quality_gate(item: dict, selected_sources: List[dict]) -> bool:
 
 
 def _extract_updates(
-    llm: OpenAI,
+    llm: anthropic.Anthropic,
     model_id: str,
     topic_name: str,
     topic_guidance: str,
@@ -736,12 +737,14 @@ def _extract_updates(
     )
 
     try:
-        resp = llm.chat.completions.create(
+        resp = llm.messages.create(
             model=model_id,
-            messages=[{"role": "system", "content": EXTRACT_SYSTEM}, {"role": "user", "content": user_prompt}],
+            max_tokens=4096,
+            system=EXTRACT_SYSTEM,
+            messages=[{"role": "user", "content": user_prompt}],
             temperature=0.1,
         )
-        raw = (resp.choices[0].message.content or "").strip()
+        raw = (resp.content[0].text or "").strip()
     except Exception:
         return []
 
@@ -829,9 +832,9 @@ def run_watchdog(
         raise RuntimeError(f"Missing required secrets: {', '.join(missing)}")
 
     tav = _tavily_client()
-    llm = _groq_client()
+    llm = _anthropic_client()
 
-    model_id = _get_secret("GROQ_MODEL") or os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+    model_id = _get_secret("ANTHROPIC_MODEL") or os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
     cache = _load_fetch_cache()
     state = load_state()
