@@ -1,6 +1,6 @@
 # Environmental Specialist Watch Dog
 
-A Streamlit + Tavily + Groq app that continuously monitors maritime environmental regulatory updates, stores deduplicated findings, and shows a simplified UI.
+A Streamlit + Tavily + Anthropic app that continuously monitors maritime environmental regulatory updates, stores deduplicated findings, and shows a simplified UI.
 
 ## What improved
 - Better source quality: preferred-domain and freshness-aware scoring fallback.
@@ -13,7 +13,7 @@ A Streamlit + Tavily + Groq app that continuously monitors maritime environmenta
 ## Prerequisites
 - Python 3.11+
 - Tavily API key
-- Groq API key
+- Anthropic API key
 
 Install dependencies:
 ```bash
@@ -23,10 +23,10 @@ pip install -r requirements.txt
 ## Environment variables
 Required:
 - `TAVILY_API_KEY`
-- `GROQ_API_KEY`
+- `ANTHROPIC_API_KEY`
 
 Optional:
-- `GROQ_MODEL` (default: `llama-3.1-8b-instant`)
+- `ANTHROPIC_MODEL` (default: `claude-sonnet-4-6`)
 - `WATCHDOG_EXTRA_URLS` (newline separated https URLs)
 - `WINDOW_DAYS` (default 730)
 - `MAX_RESULTS_PER_TOPIC` (default 12)
